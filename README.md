@@ -91,3 +91,11 @@ Exploits official config mechanism. No binary mod, no MITM, no process tampering
 ## License
 
 MIT
+
+## Star History
+
+<p align="center">
+  <a href="https://star-history.com/#yynxxxxx/Codex-5.5-codex-instruct-5.5&Date">
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=yynxxxxx/Codex-5.5-codex-instruct-5.5&type=Date" />
+  </a>
+</p>
