@@ -303,3 +303,7 @@ xattr -dr com.apple.quarantine /Applications/Codex-X.app
 ## 许可证
 
 本项目基于 [MIT License](https://github.com/yynxxxxx/Codex-X/blob/main/LICENSE) 开源。
+
+## 致谢 / Thanks
+
+感谢 [LINUX DO 论坛](https://linux.do/) 社区的关注、反馈与支持。
