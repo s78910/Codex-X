@@ -660,6 +660,7 @@ function App() {
   const [savedPrompts, setSavedPrompts] = React.useState<SavedPrompt[]>([]);
   const [aboutInfo, setAboutInfo] = React.useState<AboutInfo | null>(null);
   const [releaseInfo, setReleaseInfo] = React.useState<ReleaseInfo>({ status: "idle" });
+  const [updatePromptOpen, setUpdatePromptOpen] = React.useState(false);
   const [state, setState] = React.useState<CodexState | null>(null);
   const [backups, setBackups] = React.useState<BackupEntry[]>([]);
   const [configDir, setConfigDir] = React.useState("");
@@ -671,6 +672,7 @@ function App() {
   const [providerTomlDirty, setProviderTomlDirty] = React.useState(false);
   const [promptForm, setPromptForm] = React.useState<SavedPrompt>(blankPromptForm);
   const [officialForm, setOfficialForm] = React.useState({ model: "gpt-5.5", authJson: "" });
+  const autoUpdateCheckedRef = React.useRef(false);
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile);
@@ -959,7 +961,7 @@ function App() {
   const restoreBackup = (backupId: string) =>
     call(() => invoke<ActionResult>("restore_backup", { configDir: configDir || null, backupId }), handleActionResult);
 
-  const checkForUpdates = async () => {
+  const checkForUpdates = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
     const repo = aboutInfo?.githubRepo || FALLBACK_GITHUB_REPO;
     const appVersion = aboutInfo?.appVersion || "0.0.0";
     setReleaseInfo({ status: "checking" });
@@ -979,24 +981,32 @@ function App() {
       };
       const latestVersion = release.tag_name || release.name || "";
       const asset = releaseAssetForPlatform(release.assets || []);
+      const hasUpdate = compareVersions(latestVersion, appVersion) > 0;
       setReleaseInfo({
         status: "ok",
         latestVersion,
         htmlUrl: asset?.browser_download_url || release.html_url,
         assetName: asset?.name,
         body: release.body || "",
-        hasUpdate: compareVersions(latestVersion, appVersion) > 0,
-        message: compareVersions(latestVersion, appVersion) > 0
+        hasUpdate,
+        message: hasUpdate
           ? (lang === "zh" ? "发现新版本" : "Update available")
           : (lang === "zh" ? "当前已是最新版本" : "You are up to date"),
       });
+      if (hasUpdate) setUpdatePromptOpen(true);
     } catch (e) {
       setReleaseInfo({
         status: "error",
-        message: lang === "zh" ? `检查失败：${String(e)}` : `Check failed: ${String(e)}`,
+        message: quiet ? (lang === "zh" ? "自动检查失败" : "Auto check failed") : (lang === "zh" ? `检查失败：${String(e)}` : `Check failed: ${String(e)}`),
       });
     }
-  };
+  }, [aboutInfo?.githubRepo, aboutInfo?.appVersion, lang]);
+
+  React.useEffect(() => {
+    if (!state || !aboutInfo || autoUpdateCheckedRef.current) return;
+    autoUpdateCheckedRef.current = true;
+    void checkForUpdates({ quiet: true });
+  }, [state, aboutInfo, checkForUpdates]);
 
   const loadCcSwitchOfficialAuth = async (showToast = true) => {
     const candidate = await invoke<OfficialAuthCandidate | null>("read_ccswitch_official_auth", { dbPath: null });
@@ -1144,6 +1154,38 @@ function App() {
           </div>
         )}
         {error && <div className="toast error">{error}</div>}
+        {updatePromptOpen && releaseInfo.hasUpdate && (
+          <div className="update-mask" onClick={() => setUpdatePromptOpen(false)}>
+            <div className="update-dialog glass" onClick={(e) => e.stopPropagation()}>
+              <div className="update-head">
+                <div className="update-icon"><Sparkles size={22} /></div>
+                <div>
+                  <p className="eyebrow">Codex-X</p>
+                  <h3>{lang === "zh" ? "发现新版本" : "New version available"}</h3>
+                </div>
+              </div>
+              <div className="update-body">
+                <p>{lang === "zh" ? "检测到新版本，是否立即打开下载页？" : "A new version was found. Open the download page now?"}</p>
+                <div className="about-kv compact">
+                  <div><span>{lang === "zh" ? "当前版本" : "Current"}</span><strong>{aboutInfo?.appVersion || "-"}</strong></div>
+                  <div><span>{lang === "zh" ? "最新版本" : "Latest"}</span><strong>{releaseInfo.latestVersion || "-"}</strong></div>
+                  <div><span>{lang === "zh" ? "资源" : "Asset"}</span><code>{releaseInfo.assetName || "-"}</code></div>
+                </div>
+              </div>
+              <div className="update-actions">
+                <button className="primary-btn" onClick={() => {
+                  setUpdatePromptOpen(false);
+                  if (releaseInfo.htmlUrl) void invoke("open_url", { url: releaseInfo.htmlUrl });
+                }}>
+                  <Download size={16} /> {lang === "zh" ? "现在下载" : "Download now"}
+                </button>
+                <button className="secondary-btn" onClick={() => setUpdatePromptOpen(false)}>
+                  {lang === "zh" ? "稍后" : "Later"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {!state ? (
           <div className="panel glass center-panel">
@@ -1493,7 +1535,7 @@ function App() {
                   </div>
                   {releaseInfo.body && <pre className="release-notes">{releaseInfo.body}</pre>}
                   <div className="about-actions">
-                    <button className="primary-btn" onClick={checkForUpdates} disabled={releaseInfo.status === "checking"}><RefreshCw size={16} className={cx(releaseInfo.status === "checking" && "spin")} /> {lang === "zh" ? "检查更新" : "Check updates"}</button>
+                    <button className="primary-btn" onClick={() => void checkForUpdates()} disabled={releaseInfo.status === "checking"}><RefreshCw size={16} className={cx(releaseInfo.status === "checking" && "spin")} /> {lang === "zh" ? "检查更新" : "Check updates"}</button>
                     <button className="secondary-btn" onClick={() => releaseInfo.htmlUrl && void invoke("open_url", { url: releaseInfo.htmlUrl })} disabled={!releaseInfo.htmlUrl}><Download size={16} /> {lang === "zh" ? "打开下载页" : "Open download"}</button>
                   </div>
                 </section>

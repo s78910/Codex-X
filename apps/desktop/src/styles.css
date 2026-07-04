@@ -198,6 +198,45 @@ input, select, textarea {
 .toast.ok { color: #dbfff3; background: rgba(12, 112, 81, .88); border: 1px solid rgba(31,242,178,.3); }
 .toast.error { color: #fff; background: rgba(157, 38, 63, .92); border: 1px solid rgba(255,120,145,.35); animation: none; }
 @keyframes toast { 0% { opacity: 0; transform: translateY(-8px); } 12%, 84% { opacity: 1; transform: translateY(0); } 100% { opacity: 0; transform: translateY(-8px); } }
+
+.update-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  background: rgba(3, 7, 16, .62);
+  backdrop-filter: blur(10px);
+}
+
+.update-dialog {
+  width: min(560px, calc(100vw - 40px));
+  border-radius: 26px;
+  padding: 22px;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, .5);
+}
+
+.update-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.update-icon {
+  width: 46px;
+  height: 46px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  color: white;
+  background: linear-gradient(135deg, #7c5cff, #12d3ff);
+}
+
+.update-body { display: grid; gap: 14px; color: #dfe7f8; }
+.update-body p { margin: 0; line-height: 1.6; }
+.about-kv.compact { grid-template-columns: 1fr 1fr 1fr; }
+.update-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
