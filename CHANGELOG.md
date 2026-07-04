@@ -2,6 +2,11 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.17] - 2026-07-04
+
+- 修复 macOS Intel Release 构建 runner：从已不可用/长时间排队的 `macos-13` 切换为 `macos-15-intel`。
+- 继续保留 macOS Apple Silicon / macOS Intel / Windows MSI / Windows portable ZIP / Linux deb/rpm 多平台产物。
+
 ## [v0.2.16] - 2026-07-04
 
 - Release 新增 macOS Intel 构建，Intel Mac 用户可下载 x64 DMG。

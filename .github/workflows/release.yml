@@ -28,7 +28,7 @@ jobs:
             paths: |
               apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
           - name: macOS Intel
-            platform: macos-13
+            platform: macos-15-intel
             args: --bundles dmg
             artifact: codex-x-macos-x64
             paths: |
