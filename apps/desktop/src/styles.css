@@ -235,7 +235,7 @@ input, select, textarea {
 
 .update-body { display: grid; gap: 14px; color: #dfe7f8; }
 .update-body p { margin: 0; line-height: 1.6; }
-.about-kv.compact { grid-template-columns: 1fr 1fr 1fr; }
+.about-kv.compact { grid-template-columns: 1fr 1fr; }
 .update-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

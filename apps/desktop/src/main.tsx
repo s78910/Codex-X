@@ -676,6 +676,13 @@ function App() {
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile);
+  const releaseStatusLabel = React.useMemo(() => {
+    if (releaseInfo.status === "checking") return lang === "zh" ? "检查中" : "Checking";
+    if (releaseInfo.status === "error") return lang === "zh" ? "失败" : "Failed";
+    if (releaseInfo.hasUpdate) return lang === "zh" ? "有更新" : "Update found";
+    if (releaseInfo.status === "ok") return lang === "zh" ? "已是最新" : "Up to date";
+    return lang === "zh" ? "未检查" : "Idle";
+  }, [lang, releaseInfo.hasUpdate, releaseInfo.status]);
 
   React.useEffect(() => {
     localStorage.setItem(LANG_KEY, lang);
@@ -964,6 +971,7 @@ function App() {
   const checkForUpdates = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
     const repo = aboutInfo?.githubRepo || FALLBACK_GITHUB_REPO;
     const appVersion = aboutInfo?.appVersion || "0.0.0";
+    const releasesUrl = `https://github.com/${repo}/releases/`;
     setReleaseInfo({ status: "checking" });
     try {
       const response = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
@@ -985,7 +993,7 @@ function App() {
       setReleaseInfo({
         status: "ok",
         latestVersion,
-        htmlUrl: asset?.browser_download_url || release.html_url,
+        htmlUrl: releasesUrl,
         assetName: asset?.name,
         body: release.body || "",
         hasUpdate,
@@ -997,7 +1005,7 @@ function App() {
     } catch (e) {
       setReleaseInfo({
         status: "error",
-        message: quiet ? (lang === "zh" ? "自动检查失败" : "Auto check failed") : (lang === "zh" ? `检查失败：${String(e)}` : `Check failed: ${String(e)}`),
+        message: quiet ? (lang === "zh" ? "自动检查失败" : "Auto check failed") : (lang === "zh" ? "检查失败" : "Check failed"),
       });
     }
   }, [aboutInfo?.githubRepo, aboutInfo?.appVersion, lang]);
@@ -1169,7 +1177,6 @@ function App() {
                 <div className="about-kv compact">
                   <div><span>{lang === "zh" ? "当前版本" : "Current"}</span><strong>{aboutInfo?.appVersion || "-"}</strong></div>
                   <div><span>{lang === "zh" ? "最新版本" : "Latest"}</span><strong>{releaseInfo.latestVersion || "-"}</strong></div>
-                  <div><span>{lang === "zh" ? "资源" : "Asset"}</span><code>{releaseInfo.assetName || "-"}</code></div>
                 </div>
               </div>
               <div className="update-actions">
@@ -1525,18 +1532,17 @@ function App() {
                 <section className="panel glass about-card">
                   <div className="panel-head compact">
                     <div><p className="eyebrow">GitHub Releases</p><h3>{lang === "zh" ? "更新检查" : "Update check"}</h3></div>
-                    <StatusPill active={releaseInfo.status === "ok" && Boolean(releaseInfo.hasUpdate)} label={releaseInfo.status === "checking" ? (lang === "zh" ? "检查中" : "Checking") : releaseInfo.message || (lang === "zh" ? "未检查" : "Idle")} />
+                    <StatusPill active={releaseInfo.status === "ok" && Boolean(releaseInfo.hasUpdate)} label={releaseStatusLabel} />
                   </div>
                   <div className="about-kv">
-                    <div><span>{lang === "zh" ? "状态" : "Status"}</span><strong>{releaseInfo.status}</strong></div>
+                    <div><span>{lang === "zh" ? "状态" : "Status"}</span><strong>{releaseStatusLabel}</strong></div>
                     <div><span>{lang === "zh" ? "最新版本" : "Latest"}</span><strong>{releaseInfo.latestVersion || "-"}</strong></div>
                     <div><span>{lang === "zh" ? "资源" : "Asset"}</span><code>{releaseInfo.assetName || "-"}</code></div>
                     <div><span>{lang === "zh" ? "仓库" : "Repo"}</span><code>{aboutInfo?.githubRepo || FALLBACK_GITHUB_REPO}</code></div>
                   </div>
-                  {releaseInfo.body && <pre className="release-notes">{releaseInfo.body}</pre>}
                   <div className="about-actions">
                     <button className="primary-btn" onClick={() => void checkForUpdates()} disabled={releaseInfo.status === "checking"}><RefreshCw size={16} className={cx(releaseInfo.status === "checking" && "spin")} /> {lang === "zh" ? "检查更新" : "Check updates"}</button>
-                    <button className="secondary-btn" onClick={() => releaseInfo.htmlUrl && void invoke("open_url", { url: releaseInfo.htmlUrl })} disabled={!releaseInfo.htmlUrl}><Download size={16} /> {lang === "zh" ? "打开下载页" : "Open download"}</button>
+                    <button className="secondary-btn" onClick={() => releaseInfo.htmlUrl && void invoke("open_url", { url: releaseInfo.htmlUrl })} disabled={!releaseInfo.htmlUrl}><Download size={16} /> {lang === "zh" ? "打开下载页" : "Open releases"}</button>
                   </div>
                 </section>
               </section>

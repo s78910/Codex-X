@@ -2,6 +2,12 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [v0.2.7] - 2026-07-04
+
+- 简化更新检查页展示。
+- “打开下载页”改为打开 GitHub Releases 页面。
+- 更新弹窗保持简洁，仅提示版本差异。
+
 ## [v0.2.5] - 2026-07-04
 
 - Windows 版双击启动不再额外弹出终端窗口。
