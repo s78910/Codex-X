@@ -1475,8 +1475,8 @@ function App() {
                     <div><span>{lang === "zh" ? "项目地址" : "Project"}</span><code>{aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}</code></div>
                   </div>
                   <div className="about-actions">
-                    <button className="secondary-btn" onClick={() => window.open(aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`, "_blank")}><ExternalLink size={16} /> {lang === "zh" ? "打开项目主页" : "Open project"}</button>
-                    <button className="ghost-btn" onClick={() => window.open(`${aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}/issues`, "_blank")}><ExternalLink size={16} /> {lang === "zh" ? "反馈问题" : "Issues"}</button>
+                    <button className="secondary-btn" onClick={() => void invoke("open_url", { url: aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}` })}><ExternalLink size={16} /> {lang === "zh" ? "打开项目主页" : "Open project"}</button>
+                    <button className="ghost-btn" onClick={() => void invoke("open_url", { url: `${aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}/issues` })}><ExternalLink size={16} /> {lang === "zh" ? "反馈问题" : "Issues"}</button>
                   </div>
                 </section>
 
@@ -1494,7 +1494,7 @@ function App() {
                   {releaseInfo.body && <pre className="release-notes">{releaseInfo.body}</pre>}
                   <div className="about-actions">
                     <button className="primary-btn" onClick={checkForUpdates} disabled={releaseInfo.status === "checking"}><RefreshCw size={16} className={cx(releaseInfo.status === "checking" && "spin")} /> {lang === "zh" ? "检查更新" : "Check updates"}</button>
-                    <button className="secondary-btn" onClick={() => releaseInfo.htmlUrl && window.open(releaseInfo.htmlUrl, "_blank")} disabled={!releaseInfo.htmlUrl}><Download size={16} /> {lang === "zh" ? "打开下载页" : "Open download"}</button>
+                    <button className="secondary-btn" onClick={() => releaseInfo.htmlUrl && void invoke("open_url", { url: releaseInfo.htmlUrl })} disabled={!releaseInfo.htmlUrl}><Download size={16} /> {lang === "zh" ? "打开下载页" : "Open download"}</button>
                   </div>
                 </section>
               </section>

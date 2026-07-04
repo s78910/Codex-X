@@ -1445,6 +1445,28 @@ fn restore_backup(config_dir: Option<String>, backup_id: String) -> Result<Actio
     })
 }
 
+#[tauri::command]
+fn open_url(url: String) -> std::result::Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("URL 为空".to_string());
+    }
+
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open").arg(trimmed).status()
+    } else if cfg!(target_os = "windows") {
+        Command::new("cmd").args(["/C", "start", "", trimmed]).status()
+    } else {
+        Command::new("xdg-open").arg(trimmed).status()
+    };
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("打开失败，退出码: {:?}", s.code())),
+        Err(e) => Err(format!("打开失败: {e}")),
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -1468,6 +1490,7 @@ pub fn run() {
             save_provider_toml_config,
             list_backups,
             restore_backup,
+            open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex-X");
