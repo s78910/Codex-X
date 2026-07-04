@@ -27,3 +27,6 @@ apps/desktop/src-tauri/gen/schemas/
 # Backups
 *.bak
 *.bak_*
+
+# Release artifacts
+release-assets/
