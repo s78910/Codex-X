@@ -307,3 +307,8 @@ xattr -dr com.apple.quarantine /Applications/Codex-X.app
 ## 致谢 / Thanks
 
 感谢 [LINUX DO 论坛](https://linux.do/) 社区的关注、反馈与支持。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=yynxxxxx/Codex-X&type=Date)](https://www.star-history.com/#yynxxxxx/Codex-X&Date)
+
