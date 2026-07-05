@@ -312,5 +312,13 @@ xattr -dr com.apple.quarantine /Applications/Codex-X.app
 
 ## Star History
 
+<div align="center">
+
+[![GitHub Stars](https://img.shields.io/github/stars/yynxxxxx/Codex-X?style=social)](https://github.com/yynxxxxx/Codex-X/stargazers)
+
+> Star History 不是实时统计；新仓库或当天集中涨星时，折线图可能会延迟 24–48 小时刷新。实时 Star 数以上方 GitHub badge 为准。
+
 [![Star History Chart](https://api.star-history.com/svg?repos=yynxxxxx/Codex-X&type=Date)](https://www.star-history.com/#yynxxxxx/Codex-X&Date)
+
+</div>
 
