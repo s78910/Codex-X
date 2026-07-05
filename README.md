@@ -316,9 +316,9 @@ xattr -dr com.apple.quarantine /Applications/Codex-X.app
 
 [![GitHub Stars](https://img.shields.io/github/stars/yynxxxxx/Codex-X?style=social)](https://github.com/yynxxxxx/Codex-X/stargazers)
 
-> Star History 不是实时统计；新仓库或当天集中涨星时，折线图可能会延迟 24–48 小时刷新。实时 Star 数以上方 GitHub badge 为准。
+![Codex-X Star History](docs/assets/star-history.svg)
 
-[![Star History Chart](https://api.star-history.com/svg?repos=yynxxxxx/Codex-X&type=Date)](https://www.star-history.com/#yynxxxxx/Codex-X&Date)
+> README 使用仓库本地生成的 Star History SVG，避免第三方静态接口和 GitHub 图片代理缓存导致空白。实时交互版可查看 [star-history.com](https://www.star-history.com/?type=date&repos=yynxxxxx%2FCodex-X)。
 
 </div>
 

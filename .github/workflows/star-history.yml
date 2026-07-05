@@ -1,0 +1,34 @@
+name: Update Star History
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 2 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  update-star-history:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate star history SVG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/generate_star_history.py
+
+      - name: Commit updated chart
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- docs/assets/star-history.svg; then
+            echo "Star history is up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/assets/star-history.svg
+          git commit -m "Update star history chart"
+          git push
