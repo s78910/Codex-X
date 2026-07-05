@@ -1,3 +1,8 @@
+<p align="center">
+  <a href="README.md"><img src="https://img.shields.io/badge/中文-当前-blue" alt="中文" /></a>
+  <a href="README.en.md"><img src="https://img.shields.io/badge/English-Switch-lightgrey" alt="English" /></a>
+</p>
+
 <div align="center">
   <img src="apps/desktop/src-tauri/icons/icon.png" alt="Codex-X Logo" width="150" />
 
