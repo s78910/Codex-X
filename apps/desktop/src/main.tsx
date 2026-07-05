@@ -7,6 +7,8 @@ import {
   Download,
   ExternalLink,
   AlertCircle,
+  Eye,
+  EyeOff,
   FileCode2,
   Globe2,
   History,
@@ -23,6 +25,7 @@ import {
   Sparkles,
   TerminalSquare,
   Trash2,
+  Upload,
   Zap,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
@@ -762,9 +765,12 @@ function App() {
   const [providerForm, setProviderForm] = React.useState<SavedProvider>(defaultProviderForm);
   const [providerTomlDraft, setProviderTomlDraft] = React.useState("");
   const [providerTomlDirty, setProviderTomlDirty] = React.useState(false);
+  const [providerApiKeyVisible, setProviderApiKeyVisible] = React.useState(false);
+  const [actionBusy, setActionBusy] = React.useState<string>("");
   const [promptForm, setPromptForm] = React.useState<SavedPrompt>(blankPromptForm);
   const [officialForm, setOfficialForm] = React.useState({ model: "gpt-5.5", authJson: "" });
   const autoUpdateCheckedRef = React.useRef(false);
+  const promptImportRef = React.useRef<HTMLInputElement | null>(null);
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile);
@@ -862,6 +868,7 @@ function App() {
     return Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length);
   }, [filteredSessions, lang, sessionGroupByCwd]);
 
+  const unsyncedChatCount = Math.max(sessionStatus?.mismatchedThreads ?? 0, sessionStatus?.mismatchedSessionMeta ?? 0);
   const selectedSessionSet = React.useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
   const selectedNeedsSyncCount = React.useMemo(() => {
     const set = new Set(selectedSessionIds);
@@ -1004,6 +1011,38 @@ function App() {
         setToast(lang === "zh" ? "提示词已删除" : "Prompt deleted");
       },
     );
+
+  const importPromptMd = async (file?: File | null) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".md")) {
+      setError(lang === "zh" ? "请选择 .md 提示词文件" : "Please choose a .md prompt file");
+      return;
+    }
+    setActionBusy("importPrompt");
+    setLoading(true);
+    setError("");
+    try {
+      const content = await file.text();
+      const title = file.name.replace(/\.md$/i, "");
+      await invoke<SavedPrompt>("save_prompt", {
+        prompt: {
+          id: providerId(title),
+          title,
+          filename: file.name,
+          content,
+        },
+      });
+      const promptList = await invoke<SavedPrompt[]>("list_saved_prompts");
+      setSavedPrompts(promptList);
+      setToast(lang === "zh" ? `已导入提示词：${file.name}` : `Prompt imported: ${file.name}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+      setActionBusy("");
+      if (promptImportRef.current) promptImportRef.current.value = "";
+    }
+  };
 
   const normalizedProviderForm = (): SavedProvider => ({
     ...providerForm,
@@ -1254,28 +1293,34 @@ function App() {
     );
   };
 
-  const checkSessions = () =>
-    call(
+  const checkSessions = async () => {
+    setActionBusy("checkSessions");
+    await call(
       () => invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || null, targetProvider: null }),
       (status) => {
         setSessionStatus(status);
         setToast(status.needsSync
-          ? (lang === "zh" ? `发现 ${status.mismatchedSessionMeta + status.mismatchedThreads} 项需要同步` : "Session sync needed")
+          ? (lang === "zh" ? `发现 ${Math.max(status.mismatchedThreads, status.mismatchedSessionMeta)} 个聊天需要修复` : `${Math.max(status.mismatchedThreads, status.mismatchedSessionMeta)} chat(s) need repair`)
           : (lang === "zh" ? "会话已同步" : "Sessions are in sync"));
       },
     );
+    setActionBusy("");
+  };
 
-  const syncSessions = () =>
-    call(
+  const syncSessions = async () => {
+    setActionBusy("syncSessions");
+    await call(
       () => invoke<SessionSyncResult>("sync_sessions_provider", { configDir: configDir || null, targetProvider: null }),
       (result) => {
         setSessionStatus(result.status);
         setSelectedSessionIds([]);
         setToast(lang === "zh"
-          ? `已修复 ${result.updatedRollouts} 个会话文件、${result.updatedThreads} 条 SQLite 记录`
-          : `Updated ${result.updatedRollouts} rollout file(s), ${result.updatedThreads} SQLite row(s)`);
+          ? `已修复 ${result.updatedThreads} 条聊天记录`
+          : `Updated ${result.updatedThreads} chat row(s)`);
       },
     );
+    setActionBusy("");
+  };
 
   const toggleSessionSelected = (id: string) => {
     setSelectedSessionIds((ids) => ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id]);
@@ -1286,8 +1331,9 @@ function App() {
     setSelectedSessionIds(ids);
   };
 
-  const syncSelectedSessions = () =>
-    call(
+  const syncSelectedSessions = async () => {
+    setActionBusy("syncSelectedSessions");
+    await call(
       () => invoke<SessionSyncResult>("sync_selected_sessions_provider", {
         input: {
           configDir: configDir || null,
@@ -1299,10 +1345,12 @@ function App() {
         setSessionStatus(result.status);
         setSelectedSessionIds([]);
         setToast(lang === "zh"
-          ? `已修复选中会话：${result.updatedRollouts} 个会话文件、${result.updatedThreads} 条 SQLite 记录`
-          : `Selected sessions repaired: ${result.updatedRollouts} rollout file(s), ${result.updatedThreads} SQLite row(s)`);
+          ? `已修复选中的 ${result.updatedThreads} 条聊天记录`
+          : `Selected sessions repaired: ${result.updatedThreads} chat row(s)`);
       },
     );
+    setActionBusy("");
+  };
 
   const closeStartupWizard = () => {
     localStorage.setItem(STARTUP_WIZARD_SEEN_KEY, "1");
@@ -1618,7 +1666,24 @@ function App() {
                           </div>
                         </div>
                         <div className="form-grid provider-form-grid provider-form-cc">
-                          <Field label={t.provider.apiKey}><input type="password" value={providerForm.apiKey || ""} onChange={(e) => setProviderForm({ ...providerForm, apiKey: e.target.value })} placeholder={t.provider.apiKeyPlaceholder} /></Field>
+                          <Field label={t.provider.apiKey}>
+                            <div className="secret-input-wrap">
+                              <input
+                                type={providerApiKeyVisible ? "text" : "password"}
+                                value={providerForm.apiKey || ""}
+                                onChange={(e) => setProviderForm({ ...providerForm, apiKey: e.target.value })}
+                                placeholder={t.provider.apiKeyPlaceholder}
+                              />
+                              <button
+                                type="button"
+                                className="secret-toggle"
+                                onClick={() => setProviderApiKeyVisible((value) => !value)}
+                                aria-label={providerApiKeyVisible ? (lang === "zh" ? "隐藏 API Key" : "Hide API Key") : (lang === "zh" ? "显示 API Key" : "Show API Key")}
+                              >
+                                {providerApiKeyVisible ? <EyeOff size={16} /> : <Eye size={16} />}
+                              </button>
+                            </div>
+                          </Field>
                           <Field label={lang === "zh" ? "API 请求地址" : t.provider.baseUrl}><input value={providerForm.baseUrl} onChange={(e) => setProviderForm({ ...providerForm, baseUrl: e.target.value })} /></Field>
                           <Field label={t.provider.name}><input value={providerForm.providerName} onChange={(e) => setProviderForm({ ...providerForm, providerName: e.target.value, id: editingProviderId || providerId(e.target.value) })} /></Field>
                           <Field label={t.provider.model}><input value={providerForm.model} onChange={(e) => setProviderForm({ ...providerForm, model: e.target.value })} /></Field>
@@ -1659,7 +1724,7 @@ function App() {
                       </section>
 
                       <div className="form-actions provider-save-actions">
-                        <button className="primary-btn big" onClick={saveAndSwitch} disabled={loading}><Zap size={18} /> {t.provider.saveAndSwitch}</button>
+                        <button className="primary-btn big lively-btn" onClick={saveAndSwitch} disabled={loading}>{loading ? <Loader2 size={18} className="spin" /> : <Zap size={18} />} {loading ? (lang === "zh" ? "保存中..." : "Saving...") : t.provider.saveAndSwitch}</button>
                       </div>
                     </div>
                   </div>
@@ -1680,11 +1745,11 @@ function App() {
                     </p>
                   </div>
                   <div className="provider-title-actions">
-                    <button className="secondary-btn add-provider-btn" onClick={checkSessions} disabled={loading}>
-                      <RefreshCw size={18} className={cx(loading && "spin")} /> {lang === "zh" ? "检查会话" : "Check"}
+                    <button className="secondary-btn add-provider-btn lively-btn" onClick={checkSessions} disabled={loading}>
+                      {actionBusy === "checkSessions" ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />} {actionBusy === "checkSessions" ? (lang === "zh" ? "检查中..." : "Checking...") : (lang === "zh" ? "检查会话" : "Check")}
                     </button>
-                    <button className="primary-btn add-provider-btn" onClick={syncSessions} disabled={loading || !sessionStatus?.needsSync}>
-                      <Zap size={18} /> {lang === "zh" ? "同步 / 修复" : "Sync / repair"}
+                    <button className="primary-btn add-provider-btn lively-btn" onClick={syncSessions} disabled={loading || !sessionStatus?.needsSync}>
+                      {actionBusy === "syncSessions" ? <Loader2 size={18} className="spin" /> : <Zap size={18} />} {actionBusy === "syncSessions" ? (lang === "zh" ? "修复中..." : "Repairing...") : (lang === "zh" ? "同步 / 修复" : "Sync / repair")}
                     </button>
                   </div>
                 </div>
@@ -1702,13 +1767,11 @@ function App() {
                   {sessionStatus?.needsSync && <StatusPill active label={lang === "zh" ? "需要修复" : "Needs repair"} />}
                 </div>
 
-                <div className="session-stat-grid">
-                  <StatCard icon={<FileCode2 size={20} />} label={lang === "zh" ? "rollout 文件" : "Rollout files"} value={sessionStatus?.rolloutFiles ?? "-"} ok />
-                  <StatCard icon={<Sparkles size={20} />} label={lang === "zh" ? "session_meta" : "session_meta"} value={sessionStatus?.sessionMetaCount ?? "-"} ok />
-                  <StatCard icon={<AlertCircle size={20} />} label={lang === "zh" ? "未同步 JSONL" : "Unsynced JSONL"} value={sessionStatus?.mismatchedRollouts ?? "-"} ok={!sessionStatus?.mismatchedRollouts} />
-                  <StatCard icon={<Layers3 size={20} />} label={lang === "zh" ? "SQLite threads" : "SQLite threads"} value={sessionStatus?.sqliteThreads ?? "-"} ok />
-                  <StatCard icon={<AlertCircle size={20} />} label={lang === "zh" ? "未同步记录" : "Unsynced rows"} value={sessionStatus?.mismatchedThreads ?? "-"} ok={!sessionStatus?.mismatchedThreads} />
-                  <StatCard icon={<Code2 size={20} />} label={lang === "zh" ? "SQLite 数据库" : "SQLite DBs"} value={sessionStatus?.sqliteDbs ?? "-"} ok />
+                <div className="session-stat-grid user-session-stats">
+                  <StatCard icon={<History size={20} />} label={lang === "zh" ? "聊天总数" : "Total chats"} value={sessionStatus?.sqliteThreads ?? "-"} ok />
+                  <StatCard icon={<Layers3 size={20} />} label={lang === "zh" ? "当前已展示" : "Shown now"} value={filteredSessions.length} ok />
+                  <StatCard icon={<AlertCircle size={20} />} label={lang === "zh" ? "需要修复" : "Need repair"} value={sessionStatus ? unsyncedChatCount : "-"} ok={!unsyncedChatCount} />
+                  <StatCard icon={<CheckCircle2 size={20} />} label={lang === "zh" ? "状态" : "Status"} value={sessionStatus?.needsSync ? (lang === "zh" ? "可修复" : "Repairable") : (lang === "zh" ? "正常" : "OK")} ok={!sessionStatus?.needsSync} />
                 </div>
 
 
@@ -1740,8 +1803,8 @@ function App() {
                     <button className="secondary-btn small" onClick={() => setSelectedSessionIds([])} disabled={!selectedSessionIds.length}>
                       {lang === "zh" ? "清空选择" : "Clear"}
                     </button>
-                    <button className="primary-btn small" onClick={syncSelectedSessions} disabled={loading || selectedNeedsSyncCount === 0}>
-                      <Zap size={15} /> {lang === "zh" ? `修复选中 ${selectedNeedsSyncCount}` : `Repair ${selectedNeedsSyncCount}`}
+                    <button className="primary-btn small lively-btn" onClick={syncSelectedSessions} disabled={loading || selectedNeedsSyncCount === 0}>
+                      {actionBusy === "syncSelectedSessions" ? <Loader2 size={15} className="spin" /> : <Zap size={15} />} {actionBusy === "syncSelectedSessions" ? (lang === "zh" ? "修复中..." : "Repairing...") : (lang === "zh" ? `修复选中 ${selectedNeedsSyncCount}` : `Repair ${selectedNeedsSyncCount}`)}
                     </button>
                   </div>
 
@@ -1814,7 +1877,17 @@ function App() {
                         <h3>{t.instruction.title}</h3>
                       </div>
                       <div className="provider-title-actions">
-                        <button className="primary-btn add-provider-btn" onClick={openAddPrompt}><Plus size={18} /> {lang === "zh" ? "添加提示词" : "Add prompt"}</button>
+                        <input
+                          ref={promptImportRef}
+                          className="hidden-file-input"
+                          type="file"
+                          accept=".md,text/markdown,text/plain"
+                          onChange={(e) => void importPromptMd(e.target.files?.[0])}
+                        />
+                        <button className="secondary-btn add-provider-btn lively-btn" onClick={() => promptImportRef.current?.click()} disabled={loading}>
+                          {actionBusy === "importPrompt" ? <Loader2 size={18} className="spin" /> : <Upload size={18} />} {actionBusy === "importPrompt" ? (lang === "zh" ? "导入中..." : "Importing...") : (lang === "zh" ? "导入 md" : "Import md")}
+                        </button>
+                        <button className="primary-btn add-provider-btn lively-btn" onClick={openAddPrompt}><Plus size={18} /> {lang === "zh" ? "添加提示词" : "Add prompt"}</button>
                       </div>
                     </div>
 
@@ -1833,7 +1906,7 @@ function App() {
                               {isCurrent ? <StatusPill active label={t.provider.current} /> : <span />}
                             </div>
                             <div className="instruction-action-col">
-                              <button className="secondary-btn small" onClick={() => switchInstructionTemplate(item.id)} disabled={loading || isCurrent}>{t.instruction.enable}</button>
+                              <button className="secondary-btn small lively-btn" onClick={() => switchInstructionTemplate(item.id)} disabled={loading || isCurrent}>{t.instruction.enable}</button>
                               <button className="ghost-btn small" onClick={disableInstruction} disabled={loading || !isCurrent}>{lang === "zh" ? "禁用" : "Disable"}</button>
                             </div>
                           </div>
@@ -1854,7 +1927,7 @@ function App() {
                               {isCurrent ? <StatusPill active label={t.provider.current} /> : <span />}
                             </div>
                             <div className="instruction-action-col">
-                              <button className="secondary-btn small" onClick={() => enableSavedPrompt(prompt.id)} disabled={loading || isCurrent}>{t.instruction.enable}</button>
+                              <button className="secondary-btn small lively-btn" onClick={() => enableSavedPrompt(prompt.id)} disabled={loading || isCurrent}>{t.instruction.enable}</button>
                               <button className="ghost-btn small" onClick={disableInstruction} disabled={loading || !isCurrent}>{lang === "zh" ? "禁用" : "Disable"}</button>
                               <button className="ghost-btn small" onClick={() => openEditPrompt(prompt)}>{t.provider.edit}</button>
                               <button className="danger-btn small" onClick={() => removeSavedPrompt(prompt.id)}><Trash2 size={14} /> {t.provider.remove}</button>
@@ -1868,7 +1941,7 @@ function App() {
                           <div className="instruction-icon custom"><FileCode2 size={22} /></div>
                           <div className="instruction-main">
                             <strong>{lang === "zh" ? "当前自定义指令提示词" : "Current custom prompt"}</strong>
-                            <p>{lang === "zh" ? "当前 model_instructions_file 不是 Codex-X 内置模板。" : "The current model_instructions_file is not a built-in Codex-X template."}</p>
+                            <p>{lang === "zh" ? "当前使用的是外部提示词；切换到内置模板前会自动保存到下方列表，之后仍可重新启用。" : "An external prompt is currently active. It will be saved before switching to a built-in template so you can enable it again later."}</p>
                             <code>{state.instructionFile}</code>
                           </div>
                           <div className="instruction-status-col"><StatusPill active label={t.provider.current} /></div>
@@ -1895,8 +1968,8 @@ function App() {
                       </label>
                     </div>
                     <div className="form-actions">
-                      <button className="secondary-btn big" onClick={savePromptOnly} disabled={loading}>{lang === "zh" ? "保存" : "Save"}</button>
-                      <button className="primary-btn big" onClick={saveAndEnablePrompt} disabled={loading}><Zap size={18} /> {lang === "zh" ? "保存并启用" : "Save & enable"}</button>
+                      <button className="secondary-btn big lively-btn" onClick={savePromptOnly} disabled={loading}>{lang === "zh" ? "保存" : "Save"}</button>
+                      <button className="primary-btn big lively-btn" onClick={saveAndEnablePrompt} disabled={loading}><Zap size={18} /> {lang === "zh" ? "保存并启用" : "Save & enable"}</button>
                     </div>
                   </div>
                 )}

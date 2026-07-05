@@ -1886,3 +1886,104 @@ html, body, #root {
   .session-row { grid-template-columns: 28px 1fr; }
   .session-row-meta { grid-column: 2; padding-left: 0; }
 }
+
+/* Small interaction polish: make buttons feel alive without changing layout. */
+.primary-btn, .secondary-btn, .ghost-btn, .danger-btn {
+  position: relative;
+  overflow: hidden;
+  will-change: transform, filter;
+}
+.primary-btn:not(:disabled):active,
+.secondary-btn:not(:disabled):active,
+.ghost-btn:not(:disabled):active,
+.danger-btn:not(:disabled):active {
+  transform: translateY(1px) scale(.985);
+  filter: brightness(1.12);
+}
+.primary-btn:not(:disabled)::after,
+.secondary-btn:not(:disabled)::after,
+.ghost-btn:not(:disabled)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(circle at var(--x, 50%) var(--y, 50%), rgba(255,255,255,.22), transparent 32%);
+  transition: opacity .18s ease;
+}
+.primary-btn:not(:disabled):hover::after,
+.secondary-btn:not(:disabled):hover::after,
+.ghost-btn:not(:disabled):hover::after {
+  opacity: .55;
+}
+.lively-btn:not(:disabled) {
+  animation: subtle-ready-pulse 2.8s ease-in-out infinite;
+}
+.lively-btn:disabled {
+  animation: none;
+}
+@keyframes subtle-ready-pulse {
+  0%, 100% { box-shadow: 0 12px 28px rgba(67,112,255,.18); }
+  50% { box-shadow: 0 16px 34px rgba(18,211,255,.24); }
+}
+
+.hidden-file-input {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.secret-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.secret-input-wrap input {
+  width: 100%;
+  height: 44px;
+  padding: 0 46px 0 13px;
+}
+.secret-toggle {
+  position: absolute;
+  right: 7px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 11px;
+  color: #b8c7e4;
+  background: rgba(255,255,255,.07);
+  transition: .16s ease;
+}
+.secret-toggle:hover {
+  color: #fff;
+  background: rgba(18,211,255,.16);
+  transform: scale(1.04);
+}
+.user-session-stats {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.session-status-card.needs-sync .session-status-icon,
+.user-session-stats .stat-icon:not(.stat-icon-ok) {
+  animation: attention-glow 1.5s ease-in-out infinite;
+}
+@keyframes attention-glow {
+  0%, 100% { box-shadow: 0 0 0 rgba(255,176,32,0); }
+  50% { box-shadow: 0 0 24px rgba(255,176,32,.22); }
+}
+.provider-card,
+.instruction-row,
+.session-row,
+.stat-card {
+  transition: transform .18s ease, border-color .18s ease, background .18s ease, box-shadow .18s ease;
+}
+.provider-card:hover,
+.instruction-row:hover,
+.session-row:hover {
+  transform: translateY(-1px);
+}
+@media (max-width: 1320px) {
+  .user-session-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

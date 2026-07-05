@@ -509,6 +509,65 @@ fn delete_prompt_inner(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn resolve_instruction_path(codex_dir: &Path, value: &str) -> PathBuf {
+    let trimmed = value.trim();
+    let expanded = if trimmed == "~" {
+        home_dir().unwrap_or_else(|_| codex_dir.to_path_buf())
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|_| PathBuf::from(trimmed))
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        codex_dir.join(expanded)
+    }
+}
+
+fn remember_current_instruction_prompt(codex_dir: &Path) -> Result<Option<SavedPrompt>> {
+    let cfg = config_path(codex_dir);
+    let text = read_to_string_if_exists(&cfg)?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let doc = parse_toml_document(&cfg, &text)?;
+    let Some(current) = string_value(&doc, "model_instructions_file") else {
+        return Ok(None);
+    };
+    if is_managed_instruction_value(&current) {
+        return Ok(None);
+    }
+    let path = resolve_instruction_path(codex_dir, &current);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content = read_to_string_if_exists(&path)?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "external-prompt.md".to_string());
+    let stem = path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("external-prompt");
+    let id = format!("external-{}", sanitize_id(stem));
+    let title = format!("外部提示词 · {stem}");
+    save_prompt_inner(SavedPrompt {
+        id,
+        title,
+        filename: normalize_prompt_filename(&file_name, "external-prompt"),
+        content,
+    })
+    .map(Some)
+}
+
 fn sanitize_id(input: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -2121,6 +2180,12 @@ fn list_saved_prompts() -> Result<Vec<SavedPrompt>> {
 }
 
 #[tauri::command]
+fn remember_current_instruction(config_dir: Option<String>) -> Result<Option<SavedPrompt>> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    remember_current_instruction_prompt(&codex_dir)
+}
+
+#[tauri::command]
 fn save_prompt(prompt: SavedPrompt) -> Result<SavedPrompt> {
     let title = prompt.title.trim().to_string();
     if title.is_empty() {
@@ -2153,6 +2218,7 @@ fn delete_saved_prompt(id: String) -> Result<()> {
 fn enable_saved_prompt(config_dir: Option<String>, id: String) -> Result<ActionResult> {
     let prompt = get_saved_prompt_inner(id.trim())?;
     let codex_dir = resolve_codex_dir(config_dir)?;
+    let _ = remember_current_instruction_prompt(&codex_dir);
     fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
     let cfg = config_path(&codex_dir);
     let backup_id = create_backup(&codex_dir, "enable-custom-prompt")?;
@@ -2311,6 +2377,7 @@ fn save_official_config(input: OfficialConfigInput) -> Result<ActionResult> {
 fn enable_instruction_inner(config_dir: Option<String>, template_id: &str) -> Result<ActionResult> {
     let (filename, relative, content) = instruction_template(template_id)?;
     let codex_dir = resolve_codex_dir(config_dir)?;
+    let _ = remember_current_instruction_prompt(&codex_dir);
     fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
     let cfg = config_path(&codex_dir);
     let backup_id = create_backup(&codex_dir, "enable-instruct")?;
@@ -2584,6 +2651,7 @@ pub fn run() {
             read_ccswitch_official_auth,
             import_ccswitch_codex_providers,
             list_saved_prompts,
+            remember_current_instruction,
             save_prompt,
             delete_saved_prompt,
             enable_saved_prompt,
