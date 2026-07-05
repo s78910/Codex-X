@@ -18,6 +18,7 @@ import {
   Power,
   RefreshCw,
   RotateCcw,
+  Search,
   Settings,
   Sparkles,
   TerminalSquare,
@@ -168,8 +169,24 @@ type SessionSyncResult = {
   backupDir: string;
 };
 
+type DiagnosticItem = {
+  key: string;
+  label: string;
+  path?: string | null;
+  status: "ok" | "missing" | "manual" | string;
+  message: string;
+};
+
+type StartupDiagnostics = {
+  codexDir: string;
+  needsManualSelect: boolean;
+  summary: string;
+  items: DiagnosticItem[];
+};
+
 const INSTRUCTION_RELATIVE_UI = "./gpt5.5-unrestricted.md";
 const LANG_KEY = "codexx.lang";
+const STARTUP_WIZARD_SEEN_KEY = "codexx.startupWizardSeen";
 const FALLBACK_GITHUB_REPO = "yynxxxxx/Codex-X";
 
 const instructionTemplates: InstructionTemplate[] = [
@@ -731,6 +748,11 @@ function App() {
   const [releaseInfo, setReleaseInfo] = React.useState<ReleaseInfo>({ status: "idle" });
   const [updatePromptOpen, setUpdatePromptOpen] = React.useState(false);
   const [sessionStatus, setSessionStatus] = React.useState<SessionSyncStatus | null>(null);
+  const [startupDiagnostics, setStartupDiagnostics] = React.useState<StartupDiagnostics | null>(null);
+  const [startupWizardOpen, setStartupWizardOpen] = React.useState(() => localStorage.getItem(STARTUP_WIZARD_SEEN_KEY) !== "1");
+  const [sessionQuery, setSessionQuery] = React.useState("");
+  const [sessionGroupByCwd, setSessionGroupByCwd] = React.useState(true);
+  const [selectedSessionIds, setSelectedSessionIds] = React.useState<string[]>([]);
   const [state, setState] = React.useState<CodexState | null>(null);
   const [backups, setBackups] = React.useState<BackupEntry[]>([]);
   const [configDir, setConfigDir] = React.useState("");
@@ -817,6 +839,39 @@ function App() {
     return rows;
   }, [detectedRows, localRows, state?.model, state?.modelProvider]);
 
+  const filteredSessions = React.useMemo(() => {
+    const query = sessionQuery.trim().toLowerCase();
+    const list = sessionStatus?.sessions || [];
+    if (!query) return list;
+    return list.filter((item) => [item.title, item.cwd, item.rolloutPath, item.modelProvider, item.model, item.id]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(query)));
+  }, [sessionQuery, sessionStatus?.sessions]);
+
+  const groupedSessions = React.useMemo(() => {
+    const groups = new Map<string, SessionPreview[]>();
+    if (!sessionGroupByCwd) {
+      groups.set(lang === "zh" ? "全部会话" : "All sessions", filteredSessions);
+      return Array.from(groups.entries());
+    }
+    for (const item of filteredSessions) {
+      const key = item.cwd || (lang === "zh" ? "未记录工作目录" : "No workspace recorded");
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(item);
+    }
+    return Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length);
+  }, [filteredSessions, lang, sessionGroupByCwd]);
+
+  const selectedSessionSet = React.useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
+  const selectedNeedsSyncCount = React.useMemo(() => {
+    const set = new Set(selectedSessionIds);
+    return (sessionStatus?.sessions || []).filter((item) => set.has(item.id) && item.needsSync).length;
+  }, [selectedSessionIds, sessionStatus?.sessions]);
+
+  React.useEffect(() => {
+    setSelectedSessionIds((ids) => ids.filter((id) => (sessionStatus?.sessions || []).some((item) => item.id === id)));
+  }, [sessionStatus?.sessions]);
+
   const call = React.useCallback(async <T,>(fn: () => Promise<T>, success?: (data: T) => void) => {
     setLoading(true);
     setError("");
@@ -833,22 +888,27 @@ function App() {
   const refresh = React.useCallback(() => {
     call(
       async () => {
-        const next = await invoke<CodexState>("get_codex_state", { configDir: configDir || null });
-        const backupList = await invoke<BackupEntry[]>("list_backups");
-        const providerList = await invoke<SavedProvider[]>("list_saved_providers");
-        const promptList = await invoke<SavedPrompt[]>("list_saved_prompts");
-        const about = await invoke<AboutInfo>("get_about_info", { configDir: configDir || null });
-        const sessions = await invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || null, targetProvider: null });
-        return { next, backupList, providerList, promptList, about, sessions };
+        const [diagnostics, next, backupList, providerList, promptList, about] = await Promise.all([
+          invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: configDir || null }),
+          invoke<CodexState>("get_codex_state", { configDir: configDir || null }),
+          invoke<BackupEntry[]>("list_backups"),
+          invoke<SavedProvider[]>("list_saved_providers"),
+          invoke<SavedPrompt[]>("list_saved_prompts"),
+          invoke<AboutInfo>("get_about_info", { configDir: configDir || null }),
+        ]);
+        return { diagnostics, next, backupList, providerList, promptList, about };
       },
-      ({ next, backupList, providerList, promptList, about, sessions }) => {
+      ({ diagnostics, next, backupList, providerList, promptList, about }) => {
+        setStartupDiagnostics(diagnostics);
         setState(next);
         setBackups(backupList);
         setSavedProviders(providerList);
         setSavedPrompts(promptList);
         setAboutInfo(about);
-        setSessionStatus(sessions);
         if (!configDir) setConfigDir(next.codexDir);
+        void invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || next.codexDir || null, targetProvider: null })
+          .then(setSessionStatus)
+          .catch(() => undefined);
       },
     );
   }, [call, configDir]);
@@ -1210,11 +1270,44 @@ function App() {
       () => invoke<SessionSyncResult>("sync_sessions_provider", { configDir: configDir || null, targetProvider: null }),
       (result) => {
         setSessionStatus(result.status);
+        setSelectedSessionIds([]);
         setToast(lang === "zh"
           ? `已修复 ${result.updatedRollouts} 个会话文件、${result.updatedThreads} 条 SQLite 记录`
           : `Updated ${result.updatedRollouts} rollout file(s), ${result.updatedThreads} SQLite row(s)`);
       },
     );
+
+  const toggleSessionSelected = (id: string) => {
+    setSelectedSessionIds((ids) => ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id]);
+  };
+
+  const selectVisibleNeedsSyncSessions = () => {
+    const ids = filteredSessions.filter((item) => item.needsSync).map((item) => item.id);
+    setSelectedSessionIds(ids);
+  };
+
+  const syncSelectedSessions = () =>
+    call(
+      () => invoke<SessionSyncResult>("sync_selected_sessions_provider", {
+        input: {
+          configDir: configDir || null,
+          targetProvider: null,
+          sessionIds: selectedSessionIds,
+        },
+      }),
+      (result) => {
+        setSessionStatus(result.status);
+        setSelectedSessionIds([]);
+        setToast(lang === "zh"
+          ? `已修复选中会话：${result.updatedRollouts} 个会话文件、${result.updatedThreads} 条 SQLite 记录`
+          : `Selected sessions repaired: ${result.updatedRollouts} rollout file(s), ${result.updatedThreads} SQLite row(s)`);
+      },
+    );
+
+  const closeStartupWizard = () => {
+    localStorage.setItem(STARTUP_WIZARD_SEEN_KEY, "1");
+    setStartupWizardOpen(false);
+  };
 
   const navItems: Array<[Tab, string, React.ReactNode]> = [
     ["dashboard", t.nav.dashboard, <Layers3 size={18} />],
@@ -1304,6 +1397,54 @@ function App() {
                 </button>
                 <button className="secondary-btn" onClick={() => setUpdatePromptOpen(false)}>
                   {lang === "zh" ? "稍后" : "Later"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {startupWizardOpen && startupDiagnostics && (
+          <div className="startup-mask">
+            <div className="startup-card glass">
+              <div className="startup-head">
+                <div>
+                  <p className="eyebrow">First Run Check</p>
+                  <h3>{lang === "zh" ? "首次启动向导" : "First-run wizard"}</h3>
+                  <p>{lang === "zh" ? startupDiagnostics.summary : startupDiagnostics.summary}</p>
+                </div>
+                <button className="ghost-btn" onClick={closeStartupWizard}>{lang === "zh" ? "跳过" : "Skip"}</button>
+              </div>
+
+              <div className="startup-path-row">
+                <Field label="CODEX_HOME">
+                  <input value={configDir || startupDiagnostics.codexDir} onChange={(e) => setConfigDir(e.target.value)} placeholder="~/.codex" />
+                </Field>
+                <button className="secondary-btn" onClick={refresh} disabled={loading}>
+                  <RefreshCw size={16} className={cx(loading && "spin")} /> {lang === "zh" ? "重新检测" : "Recheck"}
+                </button>
+              </div>
+
+              <div className="startup-check-grid">
+                {startupDiagnostics.items.map((item) => (
+                  <div className={cx("startup-check-item", item.status === "ok" && "ok", item.status === "manual" && "manual")} key={item.key}>
+                    <div className="startup-check-icon">
+                      {item.status === "ok" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
+                    </div>
+                    <div>
+                      <strong>{item.label}</strong>
+                      <p>{lang === "zh" ? item.message : item.status === "ok" ? "Detected" : item.status === "manual" ? "Manual selection required" : "Not found"}</p>
+                      {item.path && <code>{item.path}</code>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="startup-actions">
+                <button className="secondary-btn" onClick={() => { setTab("settings"); closeStartupWizard(); }}>
+                  <Settings size={16} /> {lang === "zh" ? "去设置" : "Settings"}
+                </button>
+                <button className="primary-btn" onClick={closeStartupWizard}>
+                  <CheckCircle2 size={16} /> {lang === "zh" ? "进入 Codex-X" : "Enter Codex-X"}
                 </button>
               </div>
             </div>
@@ -1572,41 +1713,85 @@ function App() {
 
 
                 <div className="session-list-card">
-                  <div className="session-list-head">
+                  <div className="session-list-head session-list-head-rich">
                     <div>
                       <p className="eyebrow">{lang === "zh" ? "本地会话" : "Local threads"}</p>
                       <h4>{lang === "zh" ? "会话列表" : "Sessions"}</h4>
                     </div>
-                    <span>{lang === "zh" ? `展示 ${sessionStatus?.sessions?.length ?? 0} / ${sessionStatus?.sqliteThreads ?? 0} 条` : `${sessionStatus?.sessions?.length ?? 0} / ${sessionStatus?.sqliteThreads ?? 0} shown`}</span>
+                    <span>{lang === "zh" ? `展示 ${filteredSessions.length} / ${sessionStatus?.sqliteThreads ?? 0} 条` : `${filteredSessions.length} / ${sessionStatus?.sqliteThreads ?? 0} shown`}</span>
                   </div>
-                  {sessionStatus?.sessions?.length ? (
-                    <div className="session-list">
-                      {sessionStatus.sessions.map((item) => (
-                        <article className={cx("session-row", item.needsSync && "needs-sync")} key={item.id}>
-                          <div className="session-row-main">
-                            <div className="session-thread-icon"><History size={18} /></div>
-                            <div className="session-row-text">
-                              <div className="session-row-title">
-                                <strong>{item.title}</strong>
-                                {item.archived && <span className="mini-tag">{lang === "zh" ? "已归档" : "Archived"}</span>}
-                                {item.needsSync && <span className="mini-tag warn">{lang === "zh" ? "需同步" : "Needs sync"}</span>}
-                              </div>
-                              <p title={item.cwd || item.rolloutPath || undefined}>{compactPath(item.cwd || item.rolloutPath)}</p>
-                            </div>
+
+                  <div className="session-toolbar">
+                    <label className="session-search">
+                      <Search size={16} />
+                      <input
+                        value={sessionQuery}
+                        onChange={(e) => setSessionQuery(e.target.value)}
+                        placeholder={lang === "zh" ? "搜索标题 / cwd / Provider / ID" : "Search title / cwd / Provider / ID"}
+                      />
+                    </label>
+                    <label className="session-toggle">
+                      <input type="checkbox" checked={sessionGroupByCwd} onChange={(e) => setSessionGroupByCwd(e.target.checked)} />
+                      <span>{lang === "zh" ? "按项目路径分组" : "Group by cwd"}</span>
+                    </label>
+                    <button className="ghost-btn small" onClick={selectVisibleNeedsSyncSessions} disabled={!filteredSessions.some((item) => item.needsSync)}>
+                      {lang === "zh" ? "选择需同步" : "Select unsynced"}
+                    </button>
+                    <button className="secondary-btn small" onClick={() => setSelectedSessionIds([])} disabled={!selectedSessionIds.length}>
+                      {lang === "zh" ? "清空选择" : "Clear"}
+                    </button>
+                    <button className="primary-btn small" onClick={syncSelectedSessions} disabled={loading || selectedNeedsSyncCount === 0}>
+                      <Zap size={15} /> {lang === "zh" ? `修复选中 ${selectedNeedsSyncCount}` : `Repair ${selectedNeedsSyncCount}`}
+                    </button>
+                  </div>
+
+                  {filteredSessions.length ? (
+                    <div className="session-list enhanced-session-list">
+                      {groupedSessions.map(([group, items]) => (
+                        <div className="session-group" key={group}>
+                          <div className="session-group-title">
+                            <span title={group}>{compactPath(group, 88)}</span>
+                            <em>{items.length}</em>
                           </div>
-                          <div className="session-row-meta">
-                            <span>{formatSessionTime(item.updatedAtMs)}</span>
-                            <code>{item.modelProvider || "unknown"}</code>
-                            <em>{item.model || "model -"}</em>
-                            <small>#{shortId(item.id)}</small>
-                          </div>
-                        </article>
+                          {items.map((item) => {
+                            const providerOk = !item.needsSync;
+                            return (
+                              <article className={cx("session-row", item.needsSync && "needs-sync", selectedSessionSet.has(item.id) && "selected")} key={item.id}>
+                                <label className="session-select-box" title={item.needsSync ? (lang === "zh" ? "选择修复这个会话" : "Select this session for repair") : (lang === "zh" ? "Provider 已一致" : "Provider already matches")}>
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedSessionSet.has(item.id)}
+                                    onChange={() => toggleSessionSelected(item.id)}
+                                    disabled={!item.needsSync}
+                                  />
+                                </label>
+                                <div className="session-row-main">
+                                  <div className="session-thread-icon"><History size={18} /></div>
+                                  <div className="session-row-text">
+                                    <div className="session-row-title">
+                                      <strong>{item.title}</strong>
+                                      {item.archived && <span className="mini-tag">{lang === "zh" ? "已归档" : "Archived"}</span>}
+                                      <span className={cx("mini-tag", providerOk ? "ok" : "warn")}>{providerOk ? (lang === "zh" ? "Provider 一致" : "Provider OK") : (lang === "zh" ? "需同步" : "Needs sync")}</span>
+                                    </div>
+                                    <p title={item.cwd || item.rolloutPath || undefined}>{compactPath(item.cwd || item.rolloutPath)}</p>
+                                  </div>
+                                </div>
+                                <div className="session-row-meta">
+                                  <span title={item.updatedAtMs ? new Date(item.updatedAtMs).toLocaleString() : undefined}>{formatSessionTime(item.updatedAtMs)}</span>
+                                  <code title={item.modelProvider || undefined}>{item.modelProvider || "unknown"}</code>
+                                  <em title={item.model || undefined}>{item.model || "model -"}</em>
+                                  <small>#{shortId(item.id)}</small>
+                                </div>
+                              </article>
+                            );
+                          })}
+                        </div>
                       ))}
                     </div>
                   ) : (
                     <div className="session-empty">
                       <History size={22} />
-                      <span>{lang === "zh" ? "还没有读取到会话。点击右上角“检查会话”刷新。" : "No sessions loaded. Click Check to refresh."}</span>
+                      <span>{sessionQuery ? (lang === "zh" ? "没有匹配的会话。" : "No matching sessions.") : (lang === "zh" ? "还没有读取到会话。点击右上角“检查会话”刷新。" : "No sessions loaded. Click Check to refresh.")}</span>
                     </div>
                   )}
                 </div>
@@ -1787,6 +1972,16 @@ function App() {
                     <div className="settings-icon"><Sparkles size={20} /></div>
                     <div className="settings-copy"><strong>{t.settings.productName}</strong><p>{t.settings.productDesc}</p></div>
                     <StatusPill active label="Codex-X" />
+                  </div>
+                  <div className="settings-row">
+                    <div className="settings-icon"><CheckCircle2 size={20} /></div>
+                    <div className="settings-copy">
+                      <strong>{lang === "zh" ? "首次启动向导" : "First-run wizard"}</strong>
+                      <p>{lang === "zh" ? "重新检测 CODEX_HOME、config.toml、auth.json 和 SQLite 会话库。" : "Recheck CODEX_HOME, config.toml, auth.json and SQLite session stores."}</p>
+                    </div>
+                    <button className="secondary-btn" onClick={() => { localStorage.removeItem(STARTUP_WIZARD_SEEN_KEY); setStartupWizardOpen(true); refresh(); }}>
+                      {lang === "zh" ? "重新检测" : "Recheck"}
+                    </button>
                   </div>
                 </div>
               </section>

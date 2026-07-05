@@ -8,14 +8,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
-use toml_edit::{value, DocumentMut, Item, Table};
 
-const INSTRUCTION_FILENAME: &str = "gpt5.5-unrestricted.md";
-const INSTRUCTION_RELATIVE: &str = "./gpt5.5-unrestricted.md";
-const INSTRUCTION_CONTENT: &str = include_str!("../../../../examples/gpt5.5-unrestricted.md");
-const INSTRUCTION_54_FILENAME: &str = "gpt5.4-unrestricted.md";
-const INSTRUCTION_54_RELATIVE: &str = "./gpt5.4-unrestricted.md";
-const INSTRUCTION_54_CONTENT: &str = include_str!("../../../../examples/gpt5.4-unrestricted.md");
+mod constants;
+mod platform;
+
+use constants::*;
+use toml_edit::{value, DocumentMut, Item, Table};
 
 #[derive(Debug, Error)]
 enum CodexxError {
@@ -190,6 +188,33 @@ struct AboutInfo {
     codex_dir: String,
     project_url: String,
     github_repo: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticItem {
+    key: String,
+    label: String,
+    path: Option<String>,
+    status: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupDiagnostics {
+    codex_dir: String,
+    needs_manual_select: bool,
+    summary: String,
+    items: Vec<DiagnosticItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectedSessionSyncInput {
+    config_dir: Option<String>,
+    target_provider: Option<String>,
+    session_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1197,7 +1222,12 @@ fn normalize_workspace_path(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn scan_rollouts(codex_dir: &Path, target_provider: &str, rewrite: bool) -> Result<RolloutScan> {
+fn scan_rollouts(
+    codex_dir: &Path,
+    target_provider: &str,
+    rewrite: bool,
+    only_session_ids: Option<&HashSet<String>>,
+) -> Result<RolloutScan> {
     let mut paths = Vec::new();
     let mut scan = RolloutScan::default();
     for dir in ["sessions", "archived_sessions"] {
@@ -1243,6 +1273,15 @@ fn scan_rollouts(codex_dir: &Path, target_provider: &str, rewrite: bool) -> Resu
                                     .and_then(Value::as_str)
                                     .map(ToString::to_string);
                             }
+                            let selected_for_rewrite = only_session_ids
+                                .map(|ids| {
+                                    payload
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .map(|id| ids.contains(id))
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(true);
                             if first_cwd.is_none() {
                                 first_cwd = payload
                                     .get("cwd")
@@ -1253,8 +1292,10 @@ fn scan_rollouts(codex_dir: &Path, target_provider: &str, rewrite: bool) -> Resu
                                 != Some(target_provider)
                             {
                                 scan.mismatched_session_meta += 1;
-                                file_changed = true;
-                                if rewrite {
+                                if selected_for_rewrite {
+                                    file_changed = true;
+                                }
+                                if rewrite && selected_for_rewrite {
                                     payload.insert(
                                         "model_provider".to_string(),
                                         json!(target_provider),
@@ -1589,6 +1630,89 @@ fn create_provider_sync_backup(
     Ok(backup_dir)
 }
 
+fn update_selected_thread_provider(
+    tx: &rusqlite::Transaction<'_>,
+    cols: &HashSet<String>,
+    target_provider: &str,
+    selected_ids: &HashSet<String>,
+    thread_ids_with_user_events: &HashSet<String>,
+    cwd_by_thread_id: &HashMap<String, String>,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    for id in selected_ids {
+        updated += tx
+            .execute(
+                "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
+                (target_provider, id),
+            )
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+        if cols.contains("has_user_event") && thread_ids_with_user_events.contains(id) {
+            updated += tx
+                .execute(
+                    "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
+                    [id],
+                )
+                .map_err(|e| CodexxError::Database(e.to_string()))?;
+        }
+        if cols.contains("cwd") {
+            if let Some(cwd) = cwd_by_thread_id.get(id) {
+                updated += tx
+                    .execute(
+                        "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
+                        (cwd, id),
+                    )
+                    .map_err(|e| CodexxError::Database(e.to_string()))?;
+            }
+        }
+    }
+    Ok(updated)
+}
+
+fn apply_sqlite_provider_sync_selected(
+    codex_dir: &Path,
+    target_provider: &str,
+    selected_ids: &HashSet<String>,
+    thread_ids_with_user_events: &HashSet<String>,
+    cwd_by_thread_id: &HashMap<String, String>,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    if selected_ids.is_empty() {
+        return Ok(0);
+    }
+    for path in sqlite_candidate_paths(codex_dir) {
+        let mut conn = match Connection::open(&path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                return Err(CodexxError::Database(format!(
+                    "打开 SQLite 失败 {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        if !sqlite_has_table(&conn, "threads")? {
+            continue;
+        }
+        let cols = table_column_set(&conn, "threads")?;
+        if !cols.contains("model_provider") {
+            continue;
+        }
+        let tx = conn
+            .transaction()
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+        updated += update_selected_thread_provider(
+            &tx,
+            &cols,
+            target_provider,
+            selected_ids,
+            thread_ids_with_user_events,
+            cwd_by_thread_id,
+        )?;
+        tx.commit()
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+    }
+    Ok(updated)
+}
+
 fn apply_sqlite_provider_sync(
     codex_dir: &Path,
     target_provider: &str,
@@ -1645,13 +1769,113 @@ fn apply_sqlite_provider_sync(
     Ok(updated)
 }
 
+fn diagnostic_item(
+    key: &str,
+    label: &str,
+    path: Option<&Path>,
+    ok: bool,
+    manual_when_missing: bool,
+) -> DiagnosticItem {
+    let status = if ok {
+        "ok"
+    } else if manual_when_missing {
+        "manual"
+    } else {
+        "missing"
+    };
+    let message = match status {
+        "ok" => "检测通过",
+        "manual" => "需要手动选择",
+        _ => "未找到",
+    };
+    DiagnosticItem {
+        key: key.to_string(),
+        label: label.to_string(),
+        path: path.map(|p| p.display().to_string()),
+        status: status.to_string(),
+        message: message.to_string(),
+    }
+}
+
+fn startup_diagnostics_inner(config_dir: Option<String>) -> Result<StartupDiagnostics> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    let config = config_path(&codex_dir);
+    let auth = auth_path(&codex_dir);
+    let sqlite_paths = sqlite_candidate_paths(&codex_dir);
+    let codex_dir_ok = codex_dir.is_dir();
+    let config_ok = config.is_file();
+    let auth_ok = auth.is_file() && auth_has_material(&auth).unwrap_or(false);
+    let sqlite_ok = !sqlite_paths.is_empty();
+
+    let mut items = Vec::new();
+    items.push(diagnostic_item(
+        "codexHome",
+        "CODEX_HOME",
+        Some(&codex_dir),
+        codex_dir_ok,
+        true,
+    ));
+    items.push(diagnostic_item(
+        "config",
+        "config.toml",
+        Some(&config),
+        config_ok,
+        false,
+    ));
+    items.push(diagnostic_item(
+        "auth",
+        "auth.json",
+        Some(&auth),
+        auth_ok,
+        false,
+    ));
+    items.push(DiagnosticItem {
+        key: "sqlite".to_string(),
+        label: "SQLite 会话库".to_string(),
+        path: sqlite_paths.first().map(|p| {
+            if sqlite_paths.len() > 1 {
+                format!("{} 等 {} 个", p.display(), sqlite_paths.len())
+            } else {
+                p.display().to_string()
+            }
+        }),
+        status: if sqlite_ok { "ok" } else { "missing" }.to_string(),
+        message: if sqlite_ok {
+            "检测通过"
+        } else {
+            "未找到"
+        }
+        .to_string(),
+    });
+
+    let ok_count = items.iter().filter(|item| item.status == "ok").count();
+    let needs_manual_select = !codex_dir_ok;
+    let summary = if ok_count == items.len() {
+        "Codex 环境检测通过".to_string()
+    } else if needs_manual_select {
+        "未找到 CODEX_HOME，需要手动选择 Codex 配置目录".to_string()
+    } else {
+        format!(
+            "已检测到 {ok_count}/{} 项，缺失项不影响部分功能使用",
+            items.len()
+        )
+    };
+
+    Ok(StartupDiagnostics {
+        codex_dir: codex_dir.display().to_string(),
+        needs_manual_select,
+        summary,
+        items,
+    })
+}
+
 fn session_sync_status_inner(
     config_dir: Option<String>,
     target_provider: Option<String>,
 ) -> Result<SessionSyncStatus> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     let target = current_model_provider(&codex_dir, target_provider)?;
-    let rollouts = scan_rollouts(&codex_dir, &target, false)?;
+    let rollouts = scan_rollouts(&codex_dir, &target, false, None)?;
     let sqlite = scan_sqlite(&codex_dir, &target)?;
     let session_limit = sqlite.sqlite_threads.max(50).min(1000);
     let (sessions, session_warnings) = list_session_previews(&codex_dir, &target, session_limit)?;
@@ -1675,6 +1899,69 @@ fn session_sync_status_inner(
     })
 }
 
+fn sync_selected_sessions_provider_inner(
+    input: SelectedSessionSyncInput,
+) -> Result<SessionSyncResult> {
+    let selected_ids = input
+        .session_ids
+        .into_iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect::<HashSet<_>>();
+    if selected_ids.is_empty() {
+        return Err(CodexxError::Config("请选择至少一个会话".to_string()));
+    }
+
+    let codex_dir = resolve_codex_dir(input.config_dir)?;
+    fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
+    let target = current_model_provider(&codex_dir, input.target_provider)?;
+    let lock_dir = codex_dir.join("tmp").join("provider-sync.lock");
+    fs::create_dir_all(lock_dir.parent().unwrap_or(&codex_dir))
+        .map_err(|e| io_err(lock_dir.parent().unwrap_or(&codex_dir), e))?;
+    if lock_dir.exists() {
+        return Err(CodexxError::Config(format!(
+            "会话同步锁已存在: {}",
+            lock_dir.display()
+        )));
+    }
+    fs::create_dir_all(&lock_dir).map_err(|e| io_err(&lock_dir, e))?;
+
+    let result = (|| -> Result<SessionSyncResult> {
+        let rollouts = scan_rollouts(&codex_dir, &target, true, Some(&selected_ids))?;
+        let changed_paths = rollouts
+            .changed_files
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect::<Vec<_>>();
+        let backup_dir = create_provider_sync_backup(&codex_dir, &target, &changed_paths)?;
+
+        let mut updated_rollouts = 0usize;
+        for (path, text) in &rollouts.changed_files {
+            write_text(path, text)?;
+            updated_rollouts += 1;
+        }
+        let updated_threads = apply_sqlite_provider_sync_selected(
+            &codex_dir,
+            &target,
+            &selected_ids,
+            &rollouts.thread_ids_with_user_events,
+            &rollouts.cwd_by_thread_id,
+        )?;
+        let mut status =
+            session_sync_status_inner(Some(codex_dir.display().to_string()), Some(target.clone()))?;
+        status.backup_dir = Some(backup_dir.display().to_string());
+        Ok(SessionSyncResult {
+            status,
+            updated_rollouts,
+            updated_threads,
+            backup_dir: backup_dir.display().to_string(),
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&lock_dir);
+    result
+}
+
 fn sync_sessions_provider_inner(
     config_dir: Option<String>,
     target_provider: Option<String>,
@@ -1694,7 +1981,7 @@ fn sync_sessions_provider_inner(
     fs::create_dir_all(&lock_dir).map_err(|e| io_err(&lock_dir, e))?;
 
     let result = (|| -> Result<SessionSyncResult> {
-        let rollouts = scan_rollouts(&codex_dir, &target, true)?;
+        let rollouts = scan_rollouts(&codex_dir, &target, true, None)?;
         let sqlite_before = scan_sqlite(&codex_dir, &target)?;
         let changed_paths = rollouts
             .changed_files
@@ -1781,6 +2068,11 @@ fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table> {
 }
 
 #[tauri::command]
+fn get_startup_diagnostics(config_dir: Option<String>) -> Result<StartupDiagnostics> {
+    startup_diagnostics_inner(config_dir)
+}
+
+#[tauri::command]
 fn get_session_sync_status(
     config_dir: Option<String>,
     target_provider: Option<String>,
@@ -1797,6 +2089,11 @@ fn sync_sessions_provider(
 }
 
 #[tauri::command]
+fn sync_selected_sessions_provider(input: SelectedSessionSyncInput) -> Result<SessionSyncResult> {
+    sync_selected_sessions_provider_inner(input)
+}
+
+#[tauri::command]
 fn read_ccswitch_official_auth(db_path: Option<String>) -> Result<Option<OfficialAuthCandidate>> {
     read_ccswitch_official_auth_inner(db_path)
 }
@@ -1806,57 +2103,12 @@ fn import_ccswitch_codex_providers(db_path: Option<String>) -> Result<ImportResu
     import_ccswitch_codex_providers_inner(db_path)
 }
 
-fn command_version(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_codex_app_version() -> Option<String> {
-    let output = Command::new("/usr/libexec/PlistBuddy")
-        .args([
-            "-c",
-            "Print :CFBundleShortVersionString",
-            "/Applications/Codex.app/Contents/Info.plist",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn macos_codex_app_version() -> Option<String> {
-    None
-}
-
-fn detect_codex_version() -> Option<String> {
-    command_version("codex", &["--version"])
-        .or_else(|| command_version("codex", &["-V"]))
-        .or_else(macos_codex_app_version)
-}
-
 #[tauri::command]
 fn get_about_info(config_dir: Option<String>) -> Result<AboutInfo> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     Ok(AboutInfo {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
-        codex_version: detect_codex_version(),
+        codex_version: platform::detect_codex_version(),
         codex_dir: codex_dir.display().to_string(),
         project_url: "https://github.com/yynxxxxx/Codex-X".to_string(),
         github_repo: "yynxxxxx/Codex-X".to_string(),
@@ -2325,8 +2577,10 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_about_info,
+            get_startup_diagnostics,
             get_session_sync_status,
             sync_sessions_provider,
+            sync_selected_sessions_provider,
             read_ccswitch_official_auth,
             import_ccswitch_codex_providers,
             list_saved_prompts,
