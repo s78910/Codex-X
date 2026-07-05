@@ -312,13 +312,10 @@ xattr -dr com.apple.quarantine /Applications/Codex-X.app
 
 ## Star History
 
-<div align="center">
-
-[![GitHub Stars](https://img.shields.io/github/stars/yynxxxxx/Codex-X?style=social)](https://github.com/yynxxxxx/Codex-X/stargazers)
-
-![Codex-X Star History](docs/assets/star-history.svg)
-
-> README 使用仓库本地生成的 Star History SVG，避免第三方静态接口和 GitHub 图片代理缓存导致空白。实时交互版可查看 [star-history.com](https://www.star-history.com/?type=date&repos=yynxxxxx%2FCodex-X)。
-
-</div>
-
+<a href="https://www.star-history.com/?repos=yynxxxxx%2FCodex-X&type=date&legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yynxxxxx/Codex-X&type=date&theme=dark&legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yynxxxxx/Codex-X&type=date&legend=top-left" />
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=yynxxxxx/Codex-X&type=date&legend=top-left" />
+  </picture>
+</a>
