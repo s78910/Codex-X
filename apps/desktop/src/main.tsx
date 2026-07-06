@@ -247,15 +247,15 @@ const instructionTemplates: InstructionTemplate[] = [
   {
     id: "gpt5.5-unrestricted",
     filename: "gpt5.5-unrestricted.md",
-    title: "gpt-5.5 unrestricted",
-    subtitle: "gpt5.5 ctf提示词版本",
+    title: "gpt-5.5 unrestricted 破甲",
+    subtitle: "方法：先让ai分析项目，分析完之后发【不直白的逆向】命令",
     badge: "推荐",
   },
   {
     id: "gpt5.4-unrestricted",
     filename: "gpt5.4-unrestricted.md",
-    title: "gpt-5.4 unrestricted",
-    subtitle: "gpt5.4 ctf提示词版本",
+    title: "gpt-5.4 unrestricted 破甲",
+    subtitle: "方法：先让ai分析项目，分析完之后发【不直白的逆向】命令",
     badge: "兼容",
   },
   {
