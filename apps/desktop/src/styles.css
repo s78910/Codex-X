@@ -2172,11 +2172,15 @@ html, body, #root {
 .content > .about-page,
 .content > .settings-panel,
 .content > .update-strip {
-  animation: page-soft-in .24s cubic-bezier(.2,.8,.2,1) both;
+  animation: page-soft-in .18s ease both;
+  transform: none;
 }
 @keyframes page-soft-in {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  /* Keep page transitions opacity-only. A translateY entrance temporarily makes
+     panels taller than the scroll pane, so WebView shows a right scrollbar for
+     one frame and then hides it, which looks like page shaking. */
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 /* Skills & MCP */
