@@ -2,6 +2,16 @@
 
 All notable changes to Codex-X will be documented here.
 
+
+## [v0.2.27] - 2026-07-07
+
+- 优化【指令提示词】页面为 Skills/MCP 风格的简洁列表：左侧显示模板名称与说明，右侧使用开启/关闭切换；自定义/导入的 md 提示词增加编辑与删除图标。
+- 优化【供应商】页面操作区：移除“官方配置 / 本地保存 / gpt-5.5 / 不支持路由”等冗余信息，将切换改为“启用”，编辑/删除/测试连接改为图标按钮。
+- 新增供应商 base_url 连通性测试按钮，方便切换前检查第三方 API 地址是否可达。
+- 修复第三方 Provider 切换后可能未真正生效的问题：切换和保存 TOML 时会写入 Codex 实际读取的 `experimental_bearer_token`。
+- 对齐 cc-switch 的 Codex Provider live config 思路：从 cc-switch 导入时会识别 `experimental_bearer_token`，并避免使用 Codex 内置保留 provider id。
+- 优化启动加载链路：启动诊断、备份列表、会话同步状态改为后台刷新，减少首屏等待。
+
 ## [v0.2.26] - 2026-07-07
 
 - 修复第三方 Provider 切换后可能“看起来已切换但实际未按新供应商生效”的问题：不再把所有第三方都写成 `model_provider = "custom"`，而是写入供应商自己的稳定 ID。
