@@ -129,6 +129,10 @@ It turns several high-frequency operations into a desktop UI:
     <td>View current <code>~/.codex/config.toml</code>, edit full TOML directly from the Provider editor, and save changes back to the Codex config directory.</td>
   </tr>
   <tr>
+    <td align="center">🧠 Skills / MCP</td>
+    <td>New Skills & MCP page: read Codex Skills / MCP servers, import existing items, install Skill ZIP packages, enable / disable individual Skills or MCP servers, and check Skill update status.</td>
+  </tr>
+  <tr>
     <td align="center">🔐 Auth Management</td>
     <td>Read / edit official <code>~/.codex/auth.json</code>, and distinguish ChatGPT login-state Auth from third-party API Keys.</td>
   </tr>
@@ -233,7 +237,23 @@ Codex-X can read Codex local session data:
 
 It checks whether historical session Provider metadata matches the current configuration, and supports one-click sync / repair so historical threads can still be recognized, opened, and continued by native Codex.
 
-### 6. Cross-platform desktop app
+### 6. Skills / MCP Management
+
+Codex-X now includes a dedicated **Skills & MCP** page for managing Codex capability extensions in one place.
+
+- Skills: read existing Codex Skills, import existing items, install ZIP packages, enable / disable, and check update status
+- MCP: read Codex MCP servers, import existing items, enable / disable, and write enabled servers back to Codex <code>config.toml</code>
+- Useful for Android APK reverse engineering, Ghidra / IDA, Web / API / protocol reverse engineering, CTF, and security-testing skill packs
+
+### 7. Reverse Skills Navigation
+
+Codex-X also provides a static guide page that explains the “armor breaking” workflow, Codex-X usage flow, and categorized Android / Windows EXE / Web protocol reverse-engineering Skills with install commands and source links.
+
+Visit:
+
+https://yynxxxxx.github.io/Codex-X/
+
+### 8. Cross-platform desktop app
 
 - macOS Apple Silicon `.dmg`
 - macOS Intel `.dmg`

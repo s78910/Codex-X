@@ -129,6 +129,10 @@ Codex-X 不是普通的配置文件编辑器，而是一个面向 Codex CLI 的 
     <td>查看当前 <code>~/.codex/config.toml</code>，并在 Provider 编辑页直接编辑完整 TOML，保存后同步到 Codex 配置目录。</td>
   </tr>
   <tr>
+    <td align="center">🧠 Skills / MCP</td>
+    <td>新增技能和 MCP 管理页：读取 Codex 当前可用的 Skills / MCP，支持导入已有、从 ZIP 安装 Skill、启用 / 禁用单个 Skill 或 MCP，并可检查 Skill 更新状态。</td>
+  </tr>
+  <tr>
     <td align="center">🔐 Auth 管理</td>
     <td>读取 / 编辑官方 <code>~/.codex/auth.json</code>，区分 ChatGPT 登录态 Auth 与第三方 API Key。</td>
   </tr>
@@ -233,7 +237,23 @@ Codex-X 可以读取 Codex 本地会话数据：
 
 用于检查旧会话的 Provider 元数据是否和当前配置一致，并支持一键同步 / 修复，让历史 thread 继续被原生 Codex 识别、打开和续聊。
 
-### 6. 跨平台桌面软件
+### 6. Skills / MCP 管理
+
+Codex-X 新增独立的【技能和 MCP】页面，用于集中管理 Codex 的专业能力扩展。
+
+- Skills：读取当前 Codex Skills，支持导入已有、从 ZIP 安装、启用 / 禁用、检查更新状态
+- MCP：读取当前 Codex MCP Server，支持导入已有、启用 / 禁用，启用后写入 Codex <code>config.toml</code>
+- 适合管理 Android APK 逆向、Ghidra / IDA、Web / API / 协议逆向、CTF、安全测试等技能包
+
+### 7. 逆向 Skills 导航
+
+Codex-X 同步提供了一个静态介绍页，用来解释“破甲”、Codex-X 使用流程，并分类整理 Android / Windows EXE / Web 协议逆向 Skills、安装方式与来源地址。
+
+访问地址：
+
+https://yynxxxxx.github.io/Codex-X/
+
+### 8. 跨平台桌面软件
 
 - macOS Apple Silicon `.dmg`
 - macOS Intel `.dmg`
