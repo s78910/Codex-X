@@ -247,11 +247,40 @@ Codex-X now includes a dedicated **Skills & MCP** page for managing Codex capabi
 
 ### 7. Reverse Skills Navigation
 
-Codex-X also provides a static guide page that explains the “armor breaking” workflow, Codex-X usage flow, and categorized Android / Windows EXE / Web protocol reverse-engineering Skills with install commands and source links.
+<div align="center">
+  <a href="https://yynxxxxx.github.io/Codex-X/">
+    <img src="https://img.shields.io/badge/Codex--X-Online%20Reverse%20Skills%20Guide-0ea5e9?style=for-the-badge&logo=githubpages&logoColor=white" alt="Codex-X Online Reverse Skills Guide" />
+  </a>
+</div>
 
-Visit:
+<br />
 
-https://yynxxxxx.github.io/Codex-X/
+<table>
+  <tr>
+    <td width="55%">
+      <b>Online guide</b>: explains the “armor breaking” workflow, how to enable GPT-5.5 / unrestricted jeli in Codex-X, and how to combine it with reverse-engineering Skills.
+      <br /><br />
+      <b>Categories</b>: Android APK / Windows EXE / Web protocol reverse engineering.
+      <br /><br />
+      <b>Includes</b>: Skill purpose, install commands, source links, and recommended workflow.
+    </td>
+    <td width="45%">
+      <ul>
+        <li>🧩 GPT-5.5 / unrestricted jeli workflow</li>
+        <li>📱 Android APK reverse Skills</li>
+        <li>🪟 Windows EXE / DLL reverse Skills</li>
+        <li>🌐 Web / API / protocol reverse Skills</li>
+        <li>📋 One-click copy install commands</li>
+      </ul>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <a href="https://yynxxxxx.github.io/Codex-X/">
+    <b>🚀 Open Codex-X Reverse Skills Guide</b>
+  </a>
+</p>
 
 ### 8. Cross-platform desktop app
 
