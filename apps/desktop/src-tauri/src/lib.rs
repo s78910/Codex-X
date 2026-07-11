@@ -75,6 +75,10 @@ struct CodexState {
     model_provider: Option<String>,
     instruction_file: Option<String>,
     instruction_enabled: bool,
+    instruction_injection_mode: Option<String>,
+    instruction_template_key: Option<String>,
+    agents_path: String,
+    active_saved_provider_id: Option<String>,
     providers: Vec<ProviderSummary>,
     config_text: String,
     auth_preview: Option<Value>,
@@ -93,6 +97,12 @@ struct BackupMeta {
     auth_path: String,
     had_config: bool,
     had_auth: bool,
+    #[serde(default)]
+    agents_path: String,
+    #[serde(default)]
+    had_agents: bool,
+    #[serde(default)]
+    tracks_agents: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,6 +114,7 @@ struct BackupEntry {
     path: String,
     had_config: bool,
     had_auth: bool,
+    had_agents: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,12 +183,36 @@ struct SavedPrompt {
 struct BuiltinPromptStatus {
     id: String,
     filename: String,
+    title: String,
+    subtitle: String,
+    badge: String,
     source_url: String,
     cached: bool,
     updated: bool,
     content_source: String,
     checked_at: Option<String>,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptInjectionMode {
+    Replace,
+    Append,
+}
+
+impl PromptInjectionMode {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value
+            .unwrap_or("replace")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "replace" | "model" => Ok(Self::Replace),
+            "append" | "agents" => Ok(Self::Append),
+            other => Err(CodexxError::Config(format!("未知提示词注入模式: {other}"))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -807,52 +842,159 @@ fn find_saved_prompt_by_current_file(filename: &str, content: &str) -> Result<Op
     }
 }
 
-fn builtin_prompt_meta(
-    template_id: &str,
-) -> Result<(&'static str, &'static str, &'static str, &'static str)> {
-    match template_id.trim() {
-        "gpt5.5-jeli" => Ok((
-            "gpt5.5-jeli",
-            INSTRUCTION_JELI_FILENAME,
-            INSTRUCTION_JELI_RELATIVE,
-            INSTRUCTION_JELI_CONTENT,
-        )),
-        "gpt5.4-unrestricted" => Ok((
-            "gpt5.4-unrestricted",
-            INSTRUCTION_54_FILENAME,
-            INSTRUCTION_54_RELATIVE,
-            INSTRUCTION_54_CONTENT,
-        )),
-        "gpt5.5-unrestricted" | "" => Ok((
-            "gpt5.5-unrestricted",
-            INSTRUCTION_FILENAME,
-            INSTRUCTION_RELATIVE,
-            INSTRUCTION_CONTENT,
-        )),
-        other => Err(CodexxError::Config(format!("未知指令提示词模板: {other}"))),
-    }
+#[derive(Debug, Clone, Copy)]
+struct BundledPromptMeta {
+    id: &'static str,
+    filename: &'static str,
+    title: &'static str,
+    subtitle: &'static str,
+    badge: &'static str,
+    content: &'static str,
 }
 
-fn builtin_prompt_ids() -> [&'static str; 3] {
-    ["gpt5.5-unrestricted", "gpt5.4-unrestricted", "gpt5.5-jeli"]
+#[derive(Debug, Clone)]
+struct CachedBuiltinPrompt {
+    id: String,
+    filename: String,
+    source_url: String,
+    content: String,
+    checked_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubContentEntry {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    download_url: Option<String>,
+}
+
+fn bundled_prompt_metas() -> [BundledPromptMeta; 3] {
+    [
+        BundledPromptMeta {
+            id: "gpt5.5-unrestricted",
+            filename: INSTRUCTION_FILENAME,
+            title: "gpt-5.5 unrestricted 破甲",
+            subtitle: "方法：先让ai分析项目，分析完之后发【不直白的逆向】命令",
+            badge: "推荐",
+            content: INSTRUCTION_CONTENT,
+        },
+        BundledPromptMeta {
+            id: "gpt5.4-unrestricted",
+            filename: INSTRUCTION_54_FILENAME,
+            title: "gpt-5.4 unrestricted 破甲",
+            subtitle: "方法：先让ai分析项目，分析完之后发【不直白的逆向】命令",
+            badge: "兼容",
+            content: INSTRUCTION_54_CONTENT,
+        },
+        BundledPromptMeta {
+            id: "gpt5.5-jeli",
+            filename: INSTRUCTION_JELI_FILENAME,
+            title: "gpt5.5-jeli.md",
+            subtitle: "gpt5.5 大白话（80%场景）破甲",
+            badge: "通用",
+            content: INSTRUCTION_JELI_CONTENT,
+        },
+    ]
+}
+
+fn bundled_prompt_meta(template_id: &str) -> Option<BundledPromptMeta> {
+    let id = if template_id.trim().is_empty() {
+        "gpt5.5-unrestricted"
+    } else {
+        template_id.trim()
+    };
+    bundled_prompt_metas()
+        .into_iter()
+        .find(|item| item.id == id)
+}
+
+fn stable_remote_prompt_id(filename: &str) -> String {
+    if let Some(meta) = bundled_prompt_metas()
+        .into_iter()
+        .find(|item| item.filename.eq_ignore_ascii_case(filename))
+    {
+        return meta.id.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let stem = filename.strip_suffix(".md").unwrap_or(filename);
+    let slug = normalize_prompt_filename(stem, "remote-prompt")
+        .trim_end_matches(".md")
+        .to_string();
+    let digest = Sha256::digest(filename.to_ascii_lowercase().as_bytes());
+    let suffix = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("github-{slug}-{suffix}")
+}
+
+fn prompt_display_meta(filename: &str) -> (String, String, String) {
+    if let Some(meta) = bundled_prompt_metas()
+        .into_iter()
+        .find(|item| item.filename.eq_ignore_ascii_case(filename))
+    {
+        return (
+            meta.title.to_string(),
+            meta.subtitle.to_string(),
+            meta.badge.to_string(),
+        );
+    }
+    (
+        filename.to_string(),
+        "来自 GitHub examples 的远程提示词模板".to_string(),
+        "远程".to_string(),
+    )
 }
 
 fn builtin_prompt_source_url(filename: &str) -> String {
     format!("https://raw.githubusercontent.com/yynxxxxx/Codex-X/main/examples/{filename}")
 }
 
-fn cached_builtin_prompt(id: &str) -> Result<Option<(String, String)>> {
+fn cached_builtin_prompt(id: &str) -> Result<Option<CachedBuiltinPrompt>> {
     let conn = open_db()?;
     let mut stmt = conn
-        .prepare("SELECT content, checked_at FROM builtin_prompt_cache WHERE id = ?1")
+        .prepare(
+            "SELECT id, filename, source_url, content, checked_at
+             FROM builtin_prompt_cache WHERE id = ?1",
+        )
         .map_err(|e| CodexxError::Database(e.to_string()))?;
     match stmt.query_row([id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok(CachedBuiltinPrompt {
+            id: row.get(0)?,
+            filename: row.get(1)?,
+            source_url: row.get(2)?,
+            content: row.get(3)?,
+            checked_at: row.get(4)?,
+        })
     }) {
         Ok(value) => Ok(Some(value)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(CodexxError::Database(e.to_string())),
     }
+}
+
+fn cached_builtin_prompts() -> Result<Vec<CachedBuiltinPrompt>> {
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, filename, source_url, content, checked_at
+             FROM builtin_prompt_cache ORDER BY filename COLLATE NOCASE ASC",
+        )
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CachedBuiltinPrompt {
+                id: row.get(0)?,
+                filename: row.get(1)?,
+                source_url: row.get(2)?,
+                content: row.get(3)?,
+                checked_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    rows.map(|row| row.map_err(|e| CodexxError::Database(e.to_string())))
+        .collect()
 }
 
 fn save_builtin_prompt_cache(
@@ -896,22 +1038,85 @@ fn fetch_remote_prompt(source_url: &str) -> Result<String> {
     Ok(text)
 }
 
-fn refresh_builtin_prompt_inner(template_id: &str) -> Result<BuiltinPromptStatus> {
-    let (id, filename, _relative, bundled) = builtin_prompt_meta(template_id)?;
-    let source_url = builtin_prompt_source_url(filename);
+fn fetch_github_prompt_catalog() -> Result<Vec<(String, String, String)>> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    let response = agent
+        .get(GITHUB_EXAMPLES_API)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "Codex-X")
+        .call()
+        .map_err(|e| CodexxError::Config(format!("读取 GitHub examples 目录失败: {e}")))?;
+    let body = response
+        .into_string()
+        .map_err(|e| CodexxError::Config(format!("读取 GitHub examples 目录失败: {e}")))?;
+    let entries: Vec<GithubContentEntry> = serde_json::from_str(&body)
+        .map_err(|e| CodexxError::Config(format!("解析 GitHub examples 目录失败: {e}")))?;
+    Ok(github_prompt_catalog_from_entries(entries))
+}
+
+fn github_prompt_catalog_from_entries(
+    entries: Vec<GithubContentEntry>,
+) -> Vec<(String, String, String)> {
+    let mut prompts = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == "file"
+                && entry.name.to_ascii_lowercase().ends_with(".md")
+                && !entry.name.contains('/')
+                && !entry.name.contains('\\')
+        })
+        .filter_map(|entry| {
+            let source_url = entry.download_url?;
+            let id = stable_remote_prompt_id(&entry.name);
+            Some((id, entry.name, source_url))
+        })
+        .collect::<Vec<_>>();
+    prompts.sort_by(|a, b| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()));
+    prompts
+}
+
+fn prompt_status_from_cache(cache: CachedBuiltinPrompt, message: &str) -> BuiltinPromptStatus {
+    let (title, subtitle, badge) = prompt_display_meta(&cache.filename);
+    BuiltinPromptStatus {
+        id: cache.id,
+        filename: cache.filename,
+        title,
+        subtitle,
+        badge,
+        source_url: cache.source_url,
+        cached: true,
+        updated: false,
+        content_source: "cache".to_string(),
+        checked_at: Some(cache.checked_at),
+        message: message.to_string(),
+    }
+}
+
+fn refresh_builtin_prompt_from_source(
+    id: &str,
+    filename: &str,
+    source_url: &str,
+    bundled: Option<&str>,
+) -> Result<BuiltinPromptStatus> {
     let cached_before = cached_builtin_prompt(id)?;
+    let (title, subtitle, badge) = prompt_display_meta(filename);
     match fetch_remote_prompt(&source_url) {
         Ok(remote) => {
             let updated = cached_before
                 .as_ref()
-                .map(|(content, _)| content != &remote)
-                .unwrap_or(remote != bundled);
+                .map(|cached| cached.content != remote)
+                .unwrap_or_else(|| bundled.is_none_or(|content| remote != content));
             save_builtin_prompt_cache(id, filename, &source_url, &remote)?;
-            let checked_at = cached_builtin_prompt(id)?.map(|(_, checked_at)| checked_at);
+            let checked_at = cached_builtin_prompt(id)?.map(|cached| cached.checked_at);
             Ok(BuiltinPromptStatus {
                 id: id.to_string(),
                 filename: filename.to_string(),
-                source_url,
+                title,
+                subtitle,
+                badge,
+                source_url: source_url.to_string(),
                 cached: true,
                 updated,
                 content_source: "github".to_string(),
@@ -929,17 +1134,29 @@ fn refresh_builtin_prompt_inner(template_id: &str) -> Result<BuiltinPromptStatus
             Ok(BuiltinPromptStatus {
                 id: id.to_string(),
                 filename: filename.to_string(),
-                source_url,
+                title,
+                subtitle,
+                badge,
+                source_url: source_url.to_string(),
                 cached,
                 updated: false,
-                content_source: if cached { "cache" } else { "bundled" }.to_string(),
-                checked_at: cached_before.map(|(_, checked_at)| checked_at),
+                content_source: if cached {
+                    "cache"
+                } else if bundled.is_some() {
+                    "bundled"
+                } else {
+                    "unavailable"
+                }
+                .to_string(),
+                checked_at: cached_before.map(|item| item.checked_at),
                 message: format!(
                     "无法连接 GitHub，已使用{}：{}",
                     if cached {
                         "本地缓存"
-                    } else {
+                    } else if bundled.is_some() {
                         "打包内置版本"
+                    } else {
+                        "不可用状态"
                     },
                     e
                 ),
@@ -949,46 +1166,197 @@ fn refresh_builtin_prompt_inner(template_id: &str) -> Result<BuiltinPromptStatus
 }
 
 fn builtin_prompt_status_inner() -> Result<Vec<BuiltinPromptStatus>> {
-    builtin_prompt_ids()
+    let caches = cached_builtin_prompts()?;
+    let cache_map = caches
         .iter()
-        .map(|template_id| {
-            let (id, filename, _relative, _bundled) = builtin_prompt_meta(template_id)?;
-            let source_url = builtin_prompt_source_url(filename);
-            let cached = cached_builtin_prompt(id)?;
-            Ok(BuiltinPromptStatus {
-                id: id.to_string(),
-                filename: filename.to_string(),
-                source_url,
-                cached: cached.is_some(),
+        .cloned()
+        .map(|item| (item.id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let bundled_ids = bundled_prompt_metas()
+        .into_iter()
+        .map(|meta| meta.id.to_string())
+        .collect::<HashSet<_>>();
+    let mut statuses = Vec::new();
+    for meta in bundled_prompt_metas() {
+        if let Some(cache) = cache_map.get(meta.id).cloned() {
+            statuses.push(prompt_status_from_cache(cache, "等待后台检查 GitHub 更新"));
+        } else {
+            statuses.push(BuiltinPromptStatus {
+                id: meta.id.to_string(),
+                filename: meta.filename.to_string(),
+                title: meta.title.to_string(),
+                subtitle: meta.subtitle.to_string(),
+                badge: meta.badge.to_string(),
+                source_url: builtin_prompt_source_url(meta.filename),
+                cached: false,
                 updated: false,
-                content_source: if cached.is_some() { "cache" } else { "bundled" }.to_string(),
-                checked_at: cached.map(|(_, checked_at)| checked_at),
-                message: "未检查 GitHub 更新".to_string(),
-            })
-        })
-        .collect()
+                content_source: "bundled".to_string(),
+                checked_at: None,
+                message: "等待后台检查 GitHub 更新".to_string(),
+            });
+        }
+    }
+    for cache in caches {
+        if !bundled_ids.contains(&cache.id) {
+            statuses.push(prompt_status_from_cache(
+                cache,
+                "使用上次发现的 GitHub 模板",
+            ));
+        }
+    }
+    Ok(statuses)
 }
 
 fn refresh_builtin_prompts_inner() -> Result<Vec<BuiltinPromptStatus>> {
-    builtin_prompt_ids()
+    let catalog = match fetch_github_prompt_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let mut statuses = builtin_prompt_status_inner()?;
+            for status in &mut statuses {
+                status.message = format!("无法读取 GitHub 模板目录，已使用本地内容：{error}");
+            }
+            return Ok(statuses);
+        }
+    };
+    let remote_ids = catalog
         .iter()
-        .map(|template_id| refresh_builtin_prompt_inner(template_id))
-        .collect()
+        .map(|(id, _, _)| id.clone())
+        .collect::<HashSet<_>>();
+    let bundled_ids = bundled_prompt_metas()
+        .into_iter()
+        .map(|meta| meta.id.to_string())
+        .collect::<HashSet<_>>();
+
+    let mut statuses = Vec::new();
+    for (id, filename, source_url) in catalog {
+        let bundled = bundled_prompt_meta(&id).map(|meta| meta.content);
+        statuses.push(refresh_builtin_prompt_from_source(
+            &id,
+            &filename,
+            &source_url,
+            bundled,
+        )?);
+    }
+    for meta in bundled_prompt_metas() {
+        if !remote_ids.contains(meta.id) {
+            let cached = cached_builtin_prompt(meta.id)?;
+            statuses.push(if let Some(cache) = cached {
+                prompt_status_from_cache(cache, "GitHub 中未找到该模板，继续使用本地缓存")
+            } else {
+                BuiltinPromptStatus {
+                    id: meta.id.to_string(),
+                    filename: meta.filename.to_string(),
+                    title: meta.title.to_string(),
+                    subtitle: meta.subtitle.to_string(),
+                    badge: meta.badge.to_string(),
+                    source_url: builtin_prompt_source_url(meta.filename),
+                    cached: false,
+                    updated: false,
+                    content_source: "bundled".to_string(),
+                    checked_at: None,
+                    message: "GitHub 中未找到该模板，继续使用打包内置版本".to_string(),
+                }
+            });
+        }
+    }
+    for cache in cached_builtin_prompts()? {
+        if !bundled_ids.contains(&cache.id) && !remote_ids.contains(&cache.id) {
+            statuses.push(prompt_status_from_cache(
+                cache,
+                "GitHub 目录中已不存在该模板，已保留本地缓存",
+            ));
+        }
+    }
+    let order = bundled_prompt_metas()
+        .into_iter()
+        .enumerate()
+        .map(|(index, meta)| (meta.id, index))
+        .collect::<HashMap<_, _>>();
+    statuses.sort_by(|a, b| {
+        let a_order = order.get(a.id.as_str()).copied().unwrap_or(usize::MAX);
+        let b_order = order.get(b.id.as_str()).copied().unwrap_or(usize::MAX);
+        a_order.cmp(&b_order).then_with(|| {
+            a.filename
+                .to_ascii_lowercase()
+                .cmp(&b.filename.to_ascii_lowercase())
+        })
+    });
+    Ok(statuses)
 }
 
-fn builtin_prompt_content(
-    template_id: &str,
-) -> Result<(&'static str, &'static str, String, String)> {
-    let (id, filename, relative, bundled) = builtin_prompt_meta(template_id)?;
-    if let Some((content, _checked_at)) = cached_builtin_prompt(id)? {
-        return Ok((filename, relative, content, "本地缓存".to_string()));
+fn builtin_prompt_content(template_id: &str) -> Result<(String, String, String, String)> {
+    let id = if template_id.trim().is_empty() {
+        "gpt5.5-unrestricted"
+    } else {
+        template_id.trim()
+    };
+    let bundled = bundled_prompt_meta(id);
+    let cached = cached_builtin_prompt(id)?;
+    let filename = cached
+        .as_ref()
+        .map(|item| item.filename.clone())
+        .or_else(|| bundled.map(|item| item.filename.to_string()))
+        .ok_or_else(|| CodexxError::Config(format!("提示词模板不存在或尚未同步: {id}")))?;
+    let source_url = cached
+        .as_ref()
+        .map(|item| item.source_url.clone())
+        .unwrap_or_else(|| builtin_prompt_source_url(&filename));
+
+    if let Ok(remote) = fetch_remote_prompt(&source_url) {
+        save_builtin_prompt_cache(id, &filename, &source_url, &remote)?;
+        return Ok((
+            filename.clone(),
+            format!("./{filename}"),
+            remote,
+            "GitHub 最新".to_string(),
+        ));
     }
+    if let Some(cache) = cached {
+        return Ok((
+            cache.filename.clone(),
+            format!("./{}", cache.filename),
+            cache.content,
+            "本地缓存".to_string(),
+        ));
+    }
+    let bundled = bundled.ok_or_else(|| {
+        CodexxError::Config(format!("无法下载提示词且没有可用缓存: {template_id}"))
+    })?;
     Ok((
-        filename,
-        relative,
-        bundled.to_string(),
+        bundled.filename.to_string(),
+        format!("./{}", bundled.filename),
+        bundled.content.to_string(),
         "打包内置".to_string(),
     ))
+}
+
+fn builtin_prompt_id_for_filename(filename: &str) -> Result<Option<String>> {
+    if let Some(meta) = bundled_prompt_metas()
+        .into_iter()
+        .find(|item| item.filename.eq_ignore_ascii_case(filename))
+    {
+        return Ok(Some(meta.id.to_string()));
+    }
+    Ok(cached_builtin_prompts()?
+        .into_iter()
+        .find(|item| item.filename.eq_ignore_ascii_case(filename))
+        .map(|item| item.id))
+}
+
+fn saved_prompt_id_for_filename(filename: &str) -> Result<Option<String>> {
+    Ok(list_saved_prompts_inner()?
+        .into_iter()
+        .find(|item| item.filename.eq_ignore_ascii_case(filename))
+        .map(|item| item.id))
+}
+
+fn prompt_template_key_for_instruction(value: &str) -> Result<Option<String>> {
+    let normalized = value.replace('\\', "/");
+    let filename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if let Some(id) = builtin_prompt_id_for_filename(filename)? {
+        return Ok(Some(format!("builtin:{id}")));
+    }
+    Ok(saved_prompt_id_for_filename(filename)?.map(|id| format!("saved:{id}")))
 }
 
 fn resolve_instruction_path(codex_dir: &Path, value: &str) -> PathBuf {
@@ -1019,7 +1387,7 @@ fn remember_current_instruction_prompt(codex_dir: &Path) -> Result<Option<SavedP
     let Some(current) = string_value(&doc, "model_instructions_file") else {
         return Ok(None);
     };
-    if is_managed_instruction_value(&current) {
+    if prompt_template_key_for_instruction(&current)?.is_some() {
         return Ok(None);
     }
     let path = resolve_instruction_path(codex_dir, &current);
@@ -1519,6 +1887,24 @@ fn list_mcp_from_config(codex_dir: &Path) -> Result<Vec<ManagedMcpServer>> {
     Ok(out)
 }
 
+fn sort_managed_skills(skills: &mut [ManagedSkill]) {
+    skills.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn sort_managed_mcp_servers(servers: &mut [ManagedMcpServer]) {
+    servers.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 fn build_skills_mcp_state_inner(config_dir: Option<String>) -> Result<SkillsMcpState> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     let skills_dir = codex_skills_dir(&codex_dir);
@@ -1564,8 +1950,8 @@ fn build_skills_mcp_state_inner(config_dir: Option<String>) -> Result<SkillsMcpS
             config_json: config,
         });
     }
-    mcp_servers.sort_by(|a, b| b.enabled.cmp(&a.enabled).then_with(|| a.name.cmp(&b.name)));
-    skills.sort_by(|a, b| b.enabled.cmp(&a.enabled).then_with(|| a.name.cmp(&b.name)));
+    sort_managed_mcp_servers(&mut mcp_servers);
+    sort_managed_skills(&mut skills);
     Ok(SkillsMcpState {
         codex_dir: codex_dir.display().to_string(),
         codex_skills_dir: skills_dir.display().to_string(),
@@ -1805,8 +2191,8 @@ fn preview_existing_skills_mcp_inner(config_dir: Option<String>) -> Result<Skill
             mcp_servers.push(server);
         }
     }
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-    mcp_servers.sort_by(|a, b| a.name.cmp(&b.name));
+    sort_managed_skills(&mut skills);
+    sort_managed_mcp_servers(&mut mcp_servers);
     Ok(SkillsMcpImportPreview {
         skills,
         mcp_servers,
@@ -2687,6 +3073,10 @@ fn auth_path(codex_dir: &Path) -> PathBuf {
     codex_dir.join("auth.json")
 }
 
+fn agents_path(codex_dir: &Path) -> PathBuf {
+    codex_dir.join(AGENTS_FILENAME)
+}
+
 fn read_ccswitch_official_auth_inner(
     path: Option<String>,
 ) -> Result<Option<OfficialAuthCandidate>> {
@@ -2783,13 +3173,16 @@ fn parse_toml_document(path: &Path, text: &str) -> Result<DocumentMut> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
     }
     let tmp = path.with_extension(format!(
-        "tmp.{}.{}",
+        "tmp.{}.{}.{}",
         std::process::id(),
-        Local::now().format("%Y%m%d%H%M%S%3f")
+        Local::now().timestamp_nanos_opt().unwrap_or_default(),
+        WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
     {
         let mut file = fs::File::create(&tmp).map_err(|e| io_err(&tmp, e))?;
@@ -2813,22 +3206,127 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     write_text(path, &(text + "\n"))
 }
 
+fn managed_agents_bounds(content: &str) -> Result<Option<(usize, usize)>> {
+    let begins = content
+        .match_indices(AGENTS_MANAGED_BEGIN)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let ends = content
+        .match_indices(AGENTS_MANAGED_END)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    if begins.is_empty() && ends.is_empty() {
+        return Ok(None);
+    }
+    if begins.len() != 1 || ends.len() != 1 || begins[0] >= ends[0] {
+        return Err(CodexxError::Config(
+            "AGENTS.md 中的 Codex-X 受管区块标记不完整或重复，请先修复 BEGIN/END 标记".to_string(),
+        ));
+    }
+    Ok(Some((begins[0], ends[0] + AGENTS_MANAGED_END.len())))
+}
+
+fn remove_managed_agents_block(content: &str) -> Result<(String, bool)> {
+    let Some((start, end)) = managed_agents_bounds(content)? else {
+        return Ok((content.to_string(), false));
+    };
+    let before = content[..start].trim_end();
+    let after = content[end..].trim_start();
+    let merged = match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("{}\n", before),
+        (true, false) => format!("{}\n", after.trim_end()),
+        (false, false) => format!("{}\n\n{}\n", before, after.trim_end()),
+    };
+    Ok((merged, true))
+}
+
+fn managed_agents_template_key_from_content(content: &str) -> Option<String> {
+    let (start, end) = managed_agents_bounds(content).ok().flatten()?;
+    content[start..end].lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(AGENTS_TEMPLATE_PREFIX)
+            .and_then(|value| value.strip_suffix("-->"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn managed_agents_template_key(codex_dir: &Path) -> Result<Option<String>> {
+    let path = agents_path(codex_dir);
+    let content = read_to_string_if_exists(&path)?;
+    Ok(managed_agents_template_key_from_content(&content))
+}
+
+fn install_managed_agents_block(codex_dir: &Path, template_key: &str, content: &str) -> Result<()> {
+    let path = agents_path(codex_dir);
+    let existing = read_to_string_if_exists(&path)?;
+    let (base, _) = remove_managed_agents_block(&existing)?;
+    let managed = format!(
+        "{AGENTS_MANAGED_BEGIN}\n{AGENTS_TEMPLATE_PREFIX} {template_key} -->\n{}\n{AGENTS_MANAGED_END}",
+        content.trim()
+    );
+    let next = if base.trim().is_empty() {
+        format!("{managed}\n")
+    } else {
+        format!("{}\n\n{managed}\n", base.trim_end())
+    };
+    write_text(&path, &next)
+}
+
+fn uninstall_managed_agents_block(codex_dir: &Path) -> Result<bool> {
+    let path = agents_path(codex_dir);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = read_to_string_if_exists(&path)?;
+    let (next, removed) = remove_managed_agents_block(&existing)?;
+    if !removed {
+        return Ok(false);
+    }
+    if next.trim().is_empty() {
+        fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
+    } else {
+        write_text(&path, &next)?;
+    }
+    Ok(true)
+}
+
 fn backup_root() -> Result<PathBuf> {
     Ok(app_home()?.join("backups"))
 }
 
+fn action_backup_root(codex_dir: &Path) -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        Ok(codex_dir.join(".codexx-test-backups"))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = codex_dir;
+        backup_root()
+    }
+}
+
 fn create_backup(codex_dir: &Path, action: &str) -> Result<Option<String>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BACKUP_COUNTER: AtomicU64 = AtomicU64::new(0);
     let cfg = config_path(codex_dir);
     let auth = auth_path(codex_dir);
+    let agents = agents_path(codex_dir);
     let had_config = cfg.exists();
     let had_auth = auth.exists();
+    let had_agents = agents.exists();
 
-    if !had_config && !had_auth {
-        return Ok(None);
-    }
-
-    let id = format!("{}-{}", Local::now().format("%Y%m%d-%H%M%S"), action);
-    let dir = backup_root()?.join(&id);
+    let id = format!(
+        "{}-{}-{}",
+        Local::now().format("%Y%m%d-%H%M%S-%3f"),
+        BACKUP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        action
+    );
+    let dir = action_backup_root(codex_dir)?.join(&id);
     fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
 
     if had_config {
@@ -2836,6 +3334,9 @@ fn create_backup(codex_dir: &Path, action: &str) -> Result<Option<String>> {
     }
     if had_auth {
         fs::copy(&auth, dir.join("auth.json")).map_err(|e| io_err(&auth, e))?;
+    }
+    if had_agents {
+        fs::copy(&agents, dir.join(AGENTS_FILENAME)).map_err(|e| io_err(&agents, e))?;
     }
 
     let meta = BackupMeta {
@@ -2847,6 +3348,9 @@ fn create_backup(codex_dir: &Path, action: &str) -> Result<Option<String>> {
         auth_path: auth.display().to_string(),
         had_config,
         had_auth,
+        agents_path: agents.display().to_string(),
+        had_agents,
+        tracks_agents: true,
     };
     write_json(
         &dir.join("meta.json"),
@@ -2866,6 +3370,7 @@ fn read_backup_entry(dir: &Path) -> Option<BackupEntry> {
         path: dir.display().to_string(),
         had_config: meta.had_config,
         had_auth: meta.had_auth,
+        had_agents: meta.had_agents,
     })
 }
 
@@ -2980,6 +3485,38 @@ fn extract_providers(doc: &DocumentMut, current: Option<&str>) -> Vec<ProviderSu
         .collect()
 }
 
+fn normalized_provider_toml_for_match(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("experimental_bearer_token"))
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn active_saved_provider_id_from_config(
+    config_text: &str,
+    providers: &[SavedProvider],
+) -> Option<String> {
+    let live = normalized_provider_toml_for_match(config_text);
+    if live.is_empty() {
+        return None;
+    }
+    let matches = providers
+        .iter()
+        .filter(|provider| {
+            provider
+                .toml_config
+                .as_deref()
+                .is_some_and(|toml| normalized_provider_toml_for_match(toml) == live)
+        })
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then(|| matches[0].id.clone())
+}
+
 fn build_state(codex_dir: PathBuf) -> Result<CodexState> {
     let cfg = config_path(&codex_dir);
     let auth = auth_path(&codex_dir);
@@ -2988,10 +3525,27 @@ fn build_state(codex_dir: PathBuf) -> Result<CodexState> {
     let model = string_value(&doc, "model");
     let model_provider = string_value(&doc, "model_provider");
     let instruction_file = string_value(&doc, "model_instructions_file");
-    let instruction_enabled = instruction_file
+    let model_template_key = instruction_file
         .as_deref()
-        .is_some_and(is_managed_instruction_value);
+        .map(prompt_template_key_for_instruction)
+        .transpose()?
+        .flatten();
+    let agents_template_key = managed_agents_template_key(&codex_dir)?;
+    let (instruction_injection_mode, instruction_template_key) =
+        if let Some(key) = agents_template_key {
+            (Some("append".to_string()), Some(key))
+        } else if let Some(key) = model_template_key {
+            (Some("replace".to_string()), Some(key))
+        } else {
+            (None, None)
+        };
+    let instruction_enabled = instruction_template_key.is_some();
     let providers = extract_providers(&doc, model_provider.as_deref());
+    let active_saved_provider_id = if model_provider.as_deref() == Some("openai") {
+        None
+    } else {
+        active_saved_provider_id_from_config(&text, &list_saved_providers_inner()?)
+    };
 
     Ok(CodexState {
         codex_dir: codex_dir.display().to_string(),
@@ -3004,6 +3558,10 @@ fn build_state(codex_dir: PathBuf) -> Result<CodexState> {
         model_provider,
         instruction_file,
         instruction_enabled,
+        instruction_injection_mode,
+        instruction_template_key,
+        agents_path: agents_path(&codex_dir).display().to_string(),
+        active_saved_provider_id,
         providers,
         config_text: text,
         auth_preview: redacted_auth_preview(&auth)?,
@@ -3875,21 +4433,6 @@ fn sync_sessions_provider_inner(
     result
 }
 
-fn is_managed_instruction_value(value: &str) -> bool {
-    [
-        INSTRUCTION_FILENAME,
-        INSTRUCTION_54_FILENAME,
-        INSTRUCTION_JELI_FILENAME,
-    ]
-    .iter()
-    .any(|filename| {
-        value == format!("./{filename}")
-            || value == *filename
-            || value.ends_with(&format!("/{filename}"))
-            || value.ends_with(&format!("\\{filename}"))
-    })
-}
-
 fn set_top_level_defaults(doc: &mut DocumentMut) {
     if doc.get("model_reasoning_effort").is_none() {
         doc["model_reasoning_effort"] = value("high");
@@ -4134,37 +4677,124 @@ async fn delete_saved_prompt(id: String) -> Result<()> {
         .map_err(|e| CodexxError::Config(format!("删除提示词失败: {e}")))?
 }
 
-fn enable_saved_prompt_inner(config_dir: Option<String>, id: String) -> Result<ActionResult> {
-    let prompt = get_saved_prompt_inner(id.trim())?;
+fn managed_model_instruction_path(codex_dir: &Path, doc: &DocumentMut) -> Result<Option<PathBuf>> {
+    let Some(current) = string_value(doc, "model_instructions_file") else {
+        return Ok(None);
+    };
+    if prompt_template_key_for_instruction(&current)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(resolve_instruction_path(codex_dir, &current)))
+}
+
+fn enable_prompt_content_inner(
+    config_dir: Option<String>,
+    filename: &str,
+    content: &str,
+    template_key: &str,
+    title: &str,
+    content_source: &str,
+    injection_mode: PromptInjectionMode,
+    action: &str,
+) -> Result<ActionResult> {
+    if filename.trim().is_empty()
+        || !filename.to_ascii_lowercase().ends_with(".md")
+        || filename.contains('/')
+        || filename.contains('\\')
+    {
+        return Err(CodexxError::Config("提示词文件名无效".to_string()));
+    }
+    if template_key.trim().is_empty() || template_key.contains("-->") {
+        return Err(CodexxError::Config("提示词模板标识无效".to_string()));
+    }
+
     let codex_dir = resolve_codex_dir(config_dir)?;
-    let _ = remember_current_instruction_prompt(&codex_dir);
     fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
     let cfg = config_path(&codex_dir);
-    let backup_id = create_backup(&codex_dir, "enable-custom-prompt")?;
-
+    let agents = agents_path(&codex_dir);
     let text = read_to_string_if_exists(&cfg)?;
     let mut doc = parse_toml_document(&cfg, &text)?;
-    if doc.get("model").is_none() {
-        doc["model"] = value("gpt-5.5");
+    let agents_text = read_to_string_if_exists(&agents)?;
+    managed_agents_bounds(&agents_text)?;
+    let previous_managed_file = managed_model_instruction_path(&codex_dir, &doc)?;
+    if injection_mode == PromptInjectionMode::Replace {
+        let _ = remember_current_instruction_prompt(&codex_dir);
     }
-    doc["model_instructions_file"] = value(format!("./{}", prompt.filename));
-    write_text(&codex_dir.join(&prompt.filename), &prompt.content)?;
-    write_text(&cfg, &doc.to_string())?;
+    let backup_id = create_backup(&codex_dir, action)?;
+
+    match injection_mode {
+        PromptInjectionMode::Replace => {
+            if doc.get("model").is_none() {
+                doc["model"] = value("gpt-5.5");
+            }
+            doc["model_instructions_file"] = value(format!("./{filename}"));
+            write_text(&codex_dir.join(filename), content)?;
+            write_text(&cfg, &doc.to_string())?;
+            uninstall_managed_agents_block(&codex_dir)?;
+        }
+        PromptInjectionMode::Append => {
+            install_managed_agents_block(&codex_dir, template_key, content)?;
+            if previous_managed_file.is_some() {
+                doc.as_table_mut().remove("model_instructions_file");
+                write_text(&cfg, &doc.to_string())?;
+            }
+        }
+    }
+
+    if let Some(previous) = previous_managed_file {
+        let next = codex_dir.join(filename);
+        let should_remove = injection_mode == PromptInjectionMode::Append || previous != next;
+        if should_remove && previous.parent() == Some(codex_dir.as_path()) && previous.exists() {
+            fs::remove_file(&previous).map_err(|e| io_err(&previous, e))?;
+        }
+    }
 
     let state = build_state(codex_dir)?;
     Ok(ActionResult {
         ok: true,
-        message: format!("已启用 {}", prompt.title),
+        message: format!(
+            "已用{}模式启用 {title}（来源：{content_source}）",
+            if injection_mode == PromptInjectionMode::Append {
+                "追加"
+            } else {
+                "替换"
+            }
+        ),
         backup_id,
         state,
     })
 }
 
+fn enable_saved_prompt_inner(
+    config_dir: Option<String>,
+    id: String,
+    injection_mode: Option<String>,
+) -> Result<ActionResult> {
+    let prompt = get_saved_prompt_inner(id.trim())?;
+    let mode = PromptInjectionMode::parse(injection_mode.as_deref())?;
+    enable_prompt_content_inner(
+        config_dir,
+        &prompt.filename,
+        &prompt.content,
+        &format!("saved:{}", prompt.id),
+        &prompt.title,
+        "本地自定义",
+        mode,
+        "enable-custom-prompt",
+    )
+}
+
 #[tauri::command]
-async fn enable_saved_prompt(config_dir: Option<String>, id: String) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || enable_saved_prompt_inner(config_dir, id))
-        .await
-        .map_err(|e| CodexxError::Config(format!("启用自定义提示词失败: {e}")))?
+async fn enable_saved_prompt(
+    config_dir: Option<String>,
+    id: String,
+    injection_mode: Option<String>,
+) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        enable_saved_prompt_inner(config_dir, id, injection_mode)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("启用自定义提示词失败: {e}")))?
 }
 
 #[tauri::command]
@@ -4369,37 +4999,37 @@ fn save_official_config_inner(
     })
 }
 
-fn enable_instruction_inner(config_dir: Option<String>, template_id: &str) -> Result<ActionResult> {
-    let (filename, relative, content, content_source) = builtin_prompt_content(template_id)?;
-    let codex_dir = resolve_codex_dir(config_dir)?;
-    let _ = remember_current_instruction_prompt(&codex_dir);
-    fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
-    let cfg = config_path(&codex_dir);
-    let backup_id = create_backup(&codex_dir, "enable-instruct")?;
-
-    let text = read_to_string_if_exists(&cfg)?;
-    let mut doc = parse_toml_document(&cfg, &text)?;
-    if doc.get("model").is_none() {
-        doc["model"] = value("gpt-5.5");
-    }
-    doc["model_instructions_file"] = value(relative);
-
-    write_text(&codex_dir.join(filename), &content)?;
-    write_text(&cfg, &doc.to_string())?;
-
-    let state = build_state(codex_dir)?;
-    Ok(ActionResult {
-        ok: true,
-        message: format!("已启用 {filename}（来源：{content_source}）"),
-        backup_id,
-        state,
-    })
+fn enable_instruction_inner(
+    config_dir: Option<String>,
+    template_id: &str,
+    injection_mode: Option<String>,
+) -> Result<ActionResult> {
+    let resolved_id = if template_id.trim().is_empty() {
+        "gpt5.5-unrestricted"
+    } else {
+        template_id.trim()
+    };
+    let (filename, _relative, content, content_source) = builtin_prompt_content(resolved_id)?;
+    let mode = PromptInjectionMode::parse(injection_mode.as_deref())?;
+    enable_prompt_content_inner(
+        config_dir,
+        &filename,
+        &content,
+        &format!("builtin:{resolved_id}"),
+        &filename,
+        &content_source,
+        mode,
+        "enable-instruct",
+    )
 }
 
 #[tauri::command]
-async fn enable_instruction(config_dir: Option<String>) -> Result<ActionResult> {
+async fn enable_instruction(
+    config_dir: Option<String>,
+    injection_mode: Option<String>,
+) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        enable_instruction_inner(config_dir, "gpt5.5-unrestricted")
+        enable_instruction_inner(config_dir, "gpt5.5-unrestricted", injection_mode)
     })
     .await
     .map_err(|e| CodexxError::Config(format!("启用指令提示词失败: {e}")))?
@@ -4409,10 +5039,13 @@ async fn enable_instruction(config_dir: Option<String>) -> Result<ActionResult> 
 async fn enable_instruction_template(
     config_dir: Option<String>,
     template_id: String,
+    injection_mode: Option<String>,
 ) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || enable_instruction_inner(config_dir, &template_id))
-        .await
-        .map_err(|e| CodexxError::Config(format!("启用指令提示词失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        enable_instruction_inner(config_dir, &template_id, injection_mode)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("启用指令提示词失败: {e}")))?
 }
 
 fn disable_instruction_inner(
@@ -4421,37 +5054,38 @@ fn disable_instruction_inner(
 ) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     let cfg = config_path(&codex_dir);
+    let agents_text = read_to_string_if_exists(&agents_path(&codex_dir))?;
+    managed_agents_bounds(&agents_text)?;
     let backup_id = create_backup(&codex_dir, "disable-instruct")?;
 
     let text = read_to_string_if_exists(&cfg)?;
     let mut doc = parse_toml_document(&cfg, &text)?;
     let current = string_value(&doc, "model_instructions_file");
-    let removed = current.is_some();
-    if removed {
+    let managed_model_path = managed_model_instruction_path(&codex_dir, &doc)?;
+    let removed_model = managed_model_path.is_some();
+    if removed_model {
         doc.as_table_mut().remove("model_instructions_file");
+        write_text(&cfg, &doc.to_string())?;
     }
-
-    write_text(&cfg, &doc.to_string())?;
+    let removed_agents = uninstall_managed_agents_block(&codex_dir)?;
     if delete_file.unwrap_or(true) {
-        for filename in [
-            INSTRUCTION_FILENAME,
-            INSTRUCTION_54_FILENAME,
-            INSTRUCTION_JELI_FILENAME,
-        ] {
-            let md = codex_dir.join(filename);
-            if md.exists() {
+        if let Some(md) = managed_model_path {
+            if md.parent() == Some(codex_dir.as_path()) && md.exists() {
                 fs::remove_file(&md).map_err(|e| io_err(&md, e))?;
             }
         }
     }
 
     let state = build_state(codex_dir)?;
+    let removed = removed_model || removed_agents;
     Ok(ActionResult {
         ok: true,
         message: if removed {
             "已禁用指令提示词".to_string()
+        } else if current.is_some() {
+            "当前使用的是用户自己的提示词，Codex-X 未做修改".to_string()
         } else {
-            "当前未设置 model_instructions_file".to_string()
+            "当前没有启用 Codex-X 提示词".to_string()
         },
         backup_id,
         state,
@@ -4466,6 +5100,44 @@ async fn disable_instruction(
     tauri::async_runtime::spawn_blocking(move || disable_instruction_inner(config_dir, delete_file))
         .await
         .map_err(|e| CodexxError::Config(format!("禁用指令提示词失败: {e}")))?
+}
+
+fn disable_external_instruction_inner(config_dir: Option<String>) -> Result<ActionResult> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    let cfg = config_path(&codex_dir);
+    let text = read_to_string_if_exists(&cfg)?;
+    let mut doc = parse_toml_document(&cfg, &text)?;
+    let current = string_value(&doc, "model_instructions_file");
+    if let Some(value) = current.as_deref() {
+        if prompt_template_key_for_instruction(value)?.is_some() {
+            return Err(CodexxError::Config(
+                "当前是 Codex-X 管理的提示词，请使用普通禁用按钮".to_string(),
+            ));
+        }
+    }
+    let backup_id = create_backup(&codex_dir, "disable-external-instruct")?;
+    if current.is_some() {
+        doc.as_table_mut().remove("model_instructions_file");
+        write_text(&cfg, &doc.to_string())?;
+    }
+    let state = build_state(codex_dir)?;
+    Ok(ActionResult {
+        ok: true,
+        message: if current.is_some() {
+            "已禁用用户外部提示词，原 md 文件已保留".to_string()
+        } else {
+            "当前没有外部提示词".to_string()
+        },
+        backup_id,
+        state,
+    })
+}
+
+#[tauri::command]
+async fn disable_external_instruction(config_dir: Option<String>) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || disable_external_instruction_inner(config_dir))
+        .await
+        .map_err(|e| CodexxError::Config(format!("禁用外部提示词失败: {e}")))?
 }
 
 fn save_provider_toml_config_inner(input: ProviderTomlInput) -> Result<ActionResult> {
@@ -4704,7 +5376,7 @@ async fn list_backups() -> Result<Vec<BackupEntry>> {
 
 fn restore_backup_inner(config_dir: Option<String>, backup_id: String) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
-    let dir = backup_root()?.join(&backup_id);
+    let dir = action_backup_root(&codex_dir)?.join(&backup_id);
     if !dir.exists() {
         return Err(CodexxError::Config(format!("备份不存在: {backup_id}")));
     }
@@ -4712,7 +5384,12 @@ fn restore_backup_inner(config_dir: Option<String>, backup_id: String) -> Result
     let restore_marker = create_backup(&codex_dir, "before-restore")?;
     let cfg = config_path(&codex_dir);
     let auth = auth_path(&codex_dir);
+    let agents = agents_path(&codex_dir);
     fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
+
+    let backup_meta = fs::read_to_string(dir.join("meta.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<BackupMeta>(&text).ok());
 
     let backup_cfg = dir.join("config.toml");
     if backup_cfg.exists() {
@@ -4728,6 +5405,16 @@ fn restore_backup_inner(config_dir: Option<String>, backup_id: String) -> Result
         atomic_write(&auth, &bytes)?;
     } else if auth.exists() {
         fs::remove_file(&auth).map_err(|e| io_err(&auth, e))?;
+    }
+
+    if backup_meta.as_ref().is_some_and(|meta| meta.tracks_agents) {
+        let backup_agents = dir.join(AGENTS_FILENAME);
+        if backup_agents.exists() {
+            let bytes = fs::read(&backup_agents).map_err(|e| io_err(&backup_agents, e))?;
+            atomic_write(&agents, &bytes)?;
+        } else if agents.exists() {
+            fs::remove_file(&agents).map_err(|e| io_err(&agents, e))?;
+        }
     }
 
     let state = build_state(codex_dir)?;
@@ -4814,6 +5501,7 @@ pub fn run() {
             enable_instruction,
             enable_instruction_template,
             disable_instruction,
+            disable_external_instruction,
             switch_provider,
             save_provider_toml_config,
             test_provider_connection,
@@ -4837,6 +5525,295 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create temp codex dir");
         dir
+    }
+
+    #[test]
+    fn skills_and_mcp_order_does_not_depend_on_enabled_state() {
+        let skill = |id: &str, name: &str, enabled: bool| ManagedSkill {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            directory: id.to_string(),
+            enabled,
+            source: "test".to_string(),
+            path: String::new(),
+            content_hash: None,
+            update_status: String::new(),
+        };
+        let server = |id: &str, name: &str, enabled: bool| ManagedMcpServer {
+            id: id.to_string(),
+            name: name.to_string(),
+            transport: "stdio".to_string(),
+            enabled,
+            source: "test".to_string(),
+            summary: String::new(),
+            command: None,
+            url: None,
+            config_json: json!({}),
+        };
+        let mut skills = vec![
+            skill("beta", "Beta", true),
+            skill("alpha", "alpha", false),
+            skill("gamma", "Gamma", true),
+        ];
+        let mut servers = vec![
+            server("beta", "Beta", false),
+            server("alpha", "alpha", true),
+            server("gamma", "Gamma", false),
+        ];
+
+        sort_managed_skills(&mut skills);
+        sort_managed_mcp_servers(&mut servers);
+        let skill_order = skills
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let mcp_order = servers
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        for item in &mut skills {
+            item.enabled = !item.enabled;
+        }
+        for item in &mut servers {
+            item.enabled = !item.enabled;
+        }
+        sort_managed_skills(&mut skills);
+        sort_managed_mcp_servers(&mut servers);
+
+        assert_eq!(
+            skills
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            skill_order
+        );
+        assert_eq!(
+            servers
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            mcp_order
+        );
+    }
+
+    #[test]
+    fn managed_agents_block_preserves_user_content_and_replaces_only_managed_block() {
+        let codex_dir = temp_codex_dir("managed-agents");
+        let original = "# 我自己的规则\n使用 pnpm。\n";
+        write_text(&agents_path(&codex_dir), original).expect("write original agents");
+
+        install_managed_agents_block(
+            &codex_dir,
+            "builtin:first",
+            "# First managed prompt\nfirst rule",
+        )
+        .expect("install first block");
+        install_managed_agents_block(
+            &codex_dir,
+            "builtin:second",
+            "# Second managed prompt\nsecond rule",
+        )
+        .expect("replace managed block");
+
+        let installed = fs::read_to_string(agents_path(&codex_dir)).expect("read agents");
+        assert!(installed.starts_with(original.trim_end()));
+        assert!(installed.contains("# Second managed prompt"));
+        assert!(!installed.contains("# First managed prompt"));
+        assert_eq!(installed.matches(AGENTS_MANAGED_BEGIN).count(), 1);
+        assert_eq!(
+            managed_agents_template_key_from_content(&installed).as_deref(),
+            Some("builtin:second")
+        );
+
+        assert!(uninstall_managed_agents_block(&codex_dir).expect("uninstall block"));
+        assert_eq!(
+            fs::read_to_string(agents_path(&codex_dir)).expect("read restored agents"),
+            original
+        );
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn managed_agents_block_rejects_incomplete_markers_without_writing() {
+        let codex_dir = temp_codex_dir("managed-agents-incomplete");
+        let broken = format!("# user\n\n{AGENTS_MANAGED_BEGIN}\nunfinished\n");
+        write_text(&agents_path(&codex_dir), &broken).expect("write broken agents");
+
+        let result = install_managed_agents_block(&codex_dir, "builtin:test", "content");
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(agents_path(&codex_dir)).expect("read unchanged agents"),
+            broken
+        );
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn github_catalog_discovers_new_markdown_without_a_hardcoded_id() {
+        let catalog = github_prompt_catalog_from_entries(vec![
+            GithubContentEntry {
+                name: "brand-new-prompt.md".to_string(),
+                kind: "file".to_string(),
+                download_url: Some(
+                    "https://raw.githubusercontent.com/yynxxxxx/Codex-X/main/examples/brand-new-prompt.md"
+                        .to_string(),
+                ),
+            },
+            GithubContentEntry {
+                name: "notes.txt".to_string(),
+                kind: "file".to_string(),
+                download_url: Some("https://example.invalid/notes.txt".to_string()),
+            },
+        ]);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].1, "brand-new-prompt.md");
+        assert!(catalog[0].0.starts_with("github-brand-new-prompt-"));
+    }
+
+    #[test]
+    fn full_toml_match_selects_only_the_actual_provider() {
+        let first_toml = r#"model_provider = "custom"
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+
+[model_providers.custom]
+name = "Same API"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+"#;
+        let second_toml = r#"model_provider = "custom"
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+
+[model_providers.custom]
+name = "Same API"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+"#;
+        let provider = |id: &str, toml: &str| SavedProvider {
+            id: id.to_string(),
+            provider_name: "Same API".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            model: "gpt-5.5".to_string(),
+            api_key: Some("sk-same".to_string()),
+            toml_config: Some(toml.to_string()),
+            wire_api: "responses".to_string(),
+            requires_openai_auth: true,
+        };
+        let live = second_toml.replace(
+            "wire_api = \"responses\"",
+            "wire_api = \"responses\"\nexperimental_bearer_token = \"sk-same\"",
+        );
+        let matched = active_saved_provider_id_from_config(
+            &live,
+            &[
+                provider("first", first_toml),
+                provider("second", second_toml),
+            ],
+        );
+        assert_eq!(matched.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn append_mode_preserves_external_prompt_and_disable_removes_only_managed_agents() {
+        let codex_dir = temp_codex_dir("append-prompt");
+        write_text(
+            &config_path(&codex_dir),
+            "model = \"gpt-5.5\"\nmodel_instructions_file = \"./user-original.md\"\n",
+        )
+        .expect("write config");
+        write_text(&codex_dir.join("user-original.md"), "user prompt").expect("write user prompt");
+        write_text(&agents_path(&codex_dir), "# User AGENTS\nkeep this\n").expect("write agents");
+
+        let enabled = enable_prompt_content_inner(
+            Some(codex_dir.display().to_string()),
+            INSTRUCTION_FILENAME,
+            "managed prompt",
+            "builtin:gpt5.5-unrestricted",
+            "managed",
+            "test",
+            PromptInjectionMode::Append,
+            "test-append",
+        )
+        .expect("enable append");
+        assert_eq!(
+            enabled.state.instruction_injection_mode.as_deref(),
+            Some("append")
+        );
+        assert!(enabled.state.instruction_enabled);
+        let config = fs::read_to_string(config_path(&codex_dir)).expect("read config");
+        assert!(config.contains("model_instructions_file = \"./user-original.md\""));
+        let agents = fs::read_to_string(agents_path(&codex_dir)).expect("read agents");
+        assert!(agents.contains("# User AGENTS"));
+        assert!(agents.contains("managed prompt"));
+
+        disable_instruction_inner(Some(codex_dir.display().to_string()), Some(true))
+            .expect("disable managed append");
+        let config =
+            fs::read_to_string(config_path(&codex_dir)).expect("read config after disable");
+        assert!(config.contains("model_instructions_file = \"./user-original.md\""));
+        assert_eq!(
+            fs::read_to_string(agents_path(&codex_dir)).expect("read agents after disable"),
+            "# User AGENTS\nkeep this\n"
+        );
+        assert!(codex_dir.join("user-original.md").exists());
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn replace_mode_keeps_unrelated_agents_content() {
+        let codex_dir = temp_codex_dir("replace-prompt");
+        write_text(&agents_path(&codex_dir), "# User AGENTS\nkeep this\n").expect("write agents");
+
+        let enabled = enable_prompt_content_inner(
+            Some(codex_dir.display().to_string()),
+            INSTRUCTION_FILENAME,
+            "managed prompt",
+            "builtin:gpt5.5-unrestricted",
+            "managed",
+            "test",
+            PromptInjectionMode::Replace,
+            "test-replace",
+        )
+        .expect("enable replace");
+        assert_eq!(
+            enabled.state.instruction_injection_mode.as_deref(),
+            Some("replace")
+        );
+        assert_eq!(
+            fs::read_to_string(agents_path(&codex_dir)).expect("read agents"),
+            "# User AGENTS\nkeep this\n"
+        );
+        assert!(fs::read_to_string(config_path(&codex_dir))
+            .expect("read config")
+            .contains("model_instructions_file = \"./gpt5.5-unrestricted.md\""));
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn restore_backup_restores_agents_file_alongside_config() {
+        let codex_dir = temp_codex_dir("restore-agents");
+        write_text(&config_path(&codex_dir), "model = \"gpt-5.5\"\n").expect("write config");
+        write_text(&agents_path(&codex_dir), "# Original AGENTS\n").expect("write agents");
+        let backup_id = create_backup(&codex_dir, "before-agents-change")
+            .expect("create backup")
+            .expect("backup id");
+
+        write_text(&config_path(&codex_dir), "model = \"changed\"\n").expect("change config");
+        write_text(&agents_path(&codex_dir), "# Changed AGENTS\n").expect("change agents");
+        restore_backup_inner(Some(codex_dir.display().to_string()), backup_id)
+            .expect("restore backup");
+
+        assert_eq!(
+            fs::read_to_string(config_path(&codex_dir)).expect("read restored config"),
+            "model = \"gpt-5.5\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(agents_path(&codex_dir)).expect("read restored agents"),
+            "# Original AGENTS\n"
+        );
+        let _ = fs::remove_dir_all(codex_dir);
     }
 
     #[test]

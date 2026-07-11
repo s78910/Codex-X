@@ -105,6 +105,7 @@ nav { display: grid; gap: 8px; }
 .dashboard-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .two-col { grid-template-columns: minmax(430px, .95fr) 1fr; }
 .wide { grid-column: span 3; }
+.dashboard-config-panel { grid-column: 1 / -1; }
 .stat-card {
   min-height: 110px; border-radius: 24px; padding: 18px;
   background: linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,.04));
@@ -1497,8 +1498,9 @@ html, body, #root {
 .provider-toml-editor {
   width: 100%;
   min-height: 560px;
-  resize: vertical;
-  overflow: auto;
+  resize: none;
+  overflow-x: auto;
+  overflow-y: hidden;
   margin: 0;
   padding: 18px;
   border: 0;
@@ -1857,12 +1859,12 @@ html, body, #root {
 /* macOS overlay titlebar: keep top chrome visually integrated with the app theme. */
 .window-drag-strip {
   position: fixed;
-  z-index: 4;
-  top: 0;
-  left: 0;
-  right: 0;
+  inset: 0 0 auto;
+  z-index: 1000;
   height: 44px;
   background: linear-gradient(90deg, rgba(16,18,43,.98), rgba(4,19,31,.98));
+  user-select: none;
+  -webkit-user-select: none;
   -webkit-app-region: drag;
 }
 
@@ -2506,6 +2508,187 @@ html, body, #root {
 }
 
 /* Prompt templates use the same compact switch-list language as Skills/MCP. */
+.prompt-injection-mode-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(470px, auto);
+  align-items: center;
+  gap: 22px;
+  margin: 4px 0 14px;
+  padding: 14px 2px;
+  border-top: 1px solid rgba(124, 168, 255, .10);
+  border-bottom: 1px solid rgba(124, 168, 255, .14);
+}
+.prompt-active-summary {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+.prompt-mode-label {
+  color: #7f8da7;
+  font-size: 11px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+.prompt-active-line {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.prompt-active-line strong {
+  min-width: 0;
+  color: #eef5ff;
+  font-size: 14px;
+}
+.prompt-state-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #667085;
+  box-shadow: 0 0 0 4px rgba(102, 112, 133, .10);
+}
+.prompt-state-dot.on {
+  background: #2be09e;
+  box-shadow: 0 0 0 4px rgba(43, 224, 158, .11);
+}
+.prompt-current-mode {
+  padding: 3px 7px;
+  border-radius: 6px;
+  color: #9ff0d0;
+  background: rgba(24, 169, 117, .13);
+  border: 1px solid rgba(43, 224, 158, .18);
+  font-size: 11px;
+  font-weight: 800;
+}
+.prompt-active-detail {
+  color: #91a0bb;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.prompt-mode-choice {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  padding-left: 20px;
+  border-left: 1px solid rgba(124, 168, 255, .12);
+}
+.prompt-mode-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.prompt-mode-title-row {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+}
+.prompt-mode-copy strong { color: #eef5ff; font-size: 14px; }
+.prompt-mode-copy span { color: #91a0bb; font-size: 12px; line-height: 1.45; }
+.prompt-mode-help-btn {
+  width: 23px;
+  height: 23px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid rgba(124, 168, 255, .17);
+  color: #9fb0cd;
+  background: rgba(8, 15, 31, .64);
+  cursor: pointer;
+  transition: color .14s ease, background-color .14s ease, border-color .14s ease, transform .14s ease;
+}
+.prompt-mode-help-btn:hover,
+.prompt-mode-help-btn[aria-expanded="true"] {
+  color: #ecf6ff;
+  border-color: rgba(124, 168, 255, .32);
+  background: rgba(92, 154, 255, .14);
+}
+.prompt-mode-help-btn:active { transform: translateY(1px); }
+.prompt-mode-help-btn:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, .82);
+  outline-offset: 2px;
+}
+.prompt-mode-help-popover {
+  position: absolute;
+  right: -8px;
+  top: calc(100% + 10px);
+  z-index: 40;
+  width: min(360px, calc(100vw - 48px));
+  padding: 11px;
+  border-radius: 8px;
+  border: 1px solid rgba(124, 168, 255, .20);
+  background: linear-gradient(180deg, rgba(16, 25, 45, .98), rgba(8, 13, 26, .98));
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .38), inset 0 1px 0 rgba(255, 255, 255, .05);
+}
+.prompt-mode-help-popover::before {
+  content: "";
+  position: absolute;
+  right: 12px;
+  top: -6px;
+  width: 10px;
+  height: 10px;
+  transform: rotate(45deg);
+  border-left: 1px solid rgba(124, 168, 255, .20);
+  border-top: 1px solid rgba(124, 168, 255, .20);
+  background: rgba(16, 25, 45, .98);
+}
+.prompt-mode-help-item {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, .025);
+}
+.prompt-mode-help-item + .prompt-mode-help-item { margin-top: 7px; }
+.prompt-mode-help-item strong {
+  color: #eef5ff;
+  font-size: 13px;
+}
+.prompt-mode-help-item span {
+  color: #9dacbf;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.prompt-mode-segments {
+  flex: 0 0 auto;
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  min-width: 292px;
+  padding: 3px;
+  border-radius: 8px;
+  background: rgba(5, 10, 22, .72);
+  border: 1px solid rgba(124, 168, 255, .16);
+}
+.prompt-mode-segments button {
+  min-height: 34px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 6px;
+  color: #93a2bc;
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .14s ease, background-color .14s ease, box-shadow .14s ease;
+}
+.prompt-mode-segments button:hover { color: #edf6ff; background: rgba(92, 154, 255, .10); }
+.prompt-mode-segments button.active {
+  color: #ecfff8;
+  background: rgba(24, 169, 117, .24);
+  box-shadow: inset 0 0 0 1px rgba(43, 224, 158, .28);
+}
+.mini-tag.current-mode {
+  color: #a8f4d6;
+  background: rgba(24, 169, 117, .12);
+  border-color: rgba(43, 224, 158, .18);
+}
 .instruction-switch-list {
   gap: 8px;
 }
@@ -2539,6 +2722,14 @@ html, body, #root {
 .session-empty.compact { min-height: 74px; }
 @media (max-width: 1280px) {
   .skills-mcp-tabs { grid-template-columns: 1fr; }
+  .prompt-injection-mode-bar { grid-template-columns: 1fr; align-items: flex-start; }
+  .prompt-mode-choice {
+    width: 100%;
+    justify-content: space-between;
+    padding: 12px 0 0;
+    border-left: 0;
+    border-top: 1px solid rgba(124, 168, 255, .10);
+  }
 }
 @media (prefers-reduced-motion: reduce) {
   .content > .panel,

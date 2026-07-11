@@ -2,6 +2,33 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [Unreleased] - 2026-07-10
+
+### 更新
+
+- 指令提示词新增两种注入方式：追加模式通过 Codex-X 受管区块合并到 `CODEX_HOME/AGENTS.md`，保留用户原有规则；替换模式继续使用 `model_instructions_file` 独立提示词文件。
+- GitHub 提示词改为动态发现：Codex-X 会读取仓库 `examples/` 下的全部 `.md`，新增模板无需重新发布软件；启用时会获取最新内容，离线自动回退本地缓存或打包版本。
+- Skills / MCP 列表改为固定名称顺序，开启、关闭、刷新或检查更新后不再改变项目位置。
+- 供应商编辑页改为整页纵向滚动，`config.toml` 编辑器会随内容自动增高，不再嵌套独立的上下滚动区域。
+- 提示词页面重新区分“当前实际启用模式”和“下次启用方式”，并使用“保留原提示词 / 替换原提示词”说明实际效果；当前模板会直接显示正在使用的模式。
+- 提示词页的“启用方式”新增问号说明，补充两种模式对现有系统提示词和 `model_instructions_file` 的实际影响，帮助用户快速判断是否会覆盖现有配置。
+- 概览页移除“启用 / 禁用提示词、恢复最新备份”快捷操作，避免跳过模板和注入方式选择直接启用默认提示词。
+- Codex CLI 版本检测适配合并后的 `ChatGPT.app`，同时保留旧版 `Codex.app` 兼容。
+
+### 修复 Bug
+
+- 修复相同 Base URL、API Key、模型但 TOML 内容不同的供应商可能同时显示“当前”的问题；现在优先按完整 live TOML 匹配唯一配置，并避免重复展示 detected custom 卡片。
+- 修复追加提示词后禁用会误影响用户原有规则的风险；禁用只删除 Codex-X 管理的 AGENTS 区块或指令文件，用户其他内容保持不变。
+- 修复并发操作在同一毫秒创建备份时可能发生临时文件名冲突的问题。
+- 修复切换 Skill / MCP 开关后条目因启用状态排序而跳到列表其他位置的问题。
+- 修复 macOS Overlay 标题栏无法拖动的问题：补齐 Tauri 2 的 `core:window:allow-start-dragging` capability，并统一顶部拖动区域样式。
+- 修复 Windows 桌面应用环境中因 PATH 不完整或 `codex.cmd` 无法直接执行而检测不到 Codex CLI 版本的问题；新增 npm、ChatGPT、Cursor、VS Code 和常见安装目录探测。
+
+### 开发
+
+- 将 `AGENTS.md` 纳入 Codex-X 备份与恢复流程。
+- 增加受管区块合并/卸载、GitHub 动态模板发现、完整 TOML 供应商匹配、追加/替换模式和 AGENTS 恢复测试。
+
 ## [v0.2.31] - 2026-07-09
 
 ### 更新

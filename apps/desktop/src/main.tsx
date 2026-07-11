@@ -4,6 +4,7 @@ import {
   Activity,
   CheckCircle2,
   ChevronRight,
+  CircleHelp,
   Code2,
   Download,
   ExternalLink,
@@ -19,9 +20,7 @@ import {
   Loader2,
   PencilLine,
   Plus,
-  Power,
   RefreshCw,
-  RotateCcw,
   Search,
   Settings,
   Sparkles,
@@ -36,6 +35,7 @@ import "./styles.css";
 type Lang = "zh" | "en";
 type ProviderMode = "list" | "form" | "official";
 type InstructionMode = "list" | "form";
+type PromptInjectionMode = "append" | "replace";
 type Tab = "dashboard" | "provider" | "sessions" | "skillsMcp" | "instruction" | "toml" | "settings" | "about";
 
 type InstructionTemplate = {
@@ -76,6 +76,9 @@ type SavedPrompt = {
 type BuiltinPromptStatus = {
   id: string;
   filename: string;
+  title: string;
+  subtitle: string;
+  badge: string;
   sourceUrl: string;
   cached: boolean;
   updated: boolean;
@@ -91,6 +94,7 @@ type BackupEntry = {
   path: string;
   hadConfig: boolean;
   hadAuth: boolean;
+  hadAgents?: boolean;
 };
 
 type CodexState = {
@@ -104,6 +108,10 @@ type CodexState = {
   modelProvider?: string;
   instructionFile?: string;
   instructionEnabled: boolean;
+  instructionInjectionMode?: PromptInjectionMode;
+  instructionTemplateKey?: string;
+  agentsPath: string;
+  activeSavedProviderId?: string;
   providers: ProviderSummary[];
   configText: string;
   authPreview?: unknown;
@@ -254,14 +262,14 @@ type StartupDiagnostics = {
   items: DiagnosticItem[];
 };
 
-const INSTRUCTION_RELATIVE_UI = "./gpt5.5-unrestricted.md";
 const LANG_KEY = "codexx.lang";
 const STARTUP_WIZARD_SEEN_KEY = "codexx.startupWizardSeen";
 const AUTO_SESSION_SYNC_KEY = "codexx.autoSessionSync";
 const ACTIVE_PROVIDER_KEY = "codexx.activeProviderId";
+const PROMPT_INJECTION_MODE_KEY = "codexx.promptInjectionMode";
 const FALLBACK_GITHUB_REPO = "yynxxxxx/Codex-X";
 
-const instructionTemplates: InstructionTemplate[] = [
+const bundledInstructionTemplates: InstructionTemplate[] = [
   {
     id: "gpt5.5-unrestricted",
     filename: "gpt5.5-unrestricted.md",
@@ -353,10 +361,6 @@ const dict = {
       instructionFile: "指令文件",
       notSet: "未设置",
       officialDefault: "官方默认",
-      quickActions: "快捷操作",
-      enableInstruction: "启用指令提示词",
-      disableInstruction: "禁用指令提示词",
-      restoreLatest: "恢复最新备份",
     },
     provider: {
       title: "供应商列表",
@@ -463,10 +467,6 @@ const dict = {
       instructionFile: "Instruction",
       notSet: "Not set",
       officialDefault: "Official / Default",
-      quickActions: "Quick actions",
-      enableInstruction: "Enable prompt",
-      disableInstruction: "Disable prompt",
-      restoreLatest: "Restore latest backup",
     },
     provider: {
       title: "Provider list",
@@ -734,11 +734,21 @@ function buildProviderAuthPreview(provider: SavedProvider) {
 }
 
 
-function instructionIdFromPath(path?: string) {
+function instructionIdFromPath(path: string | undefined, templates: InstructionTemplate[]) {
   if (!path) return "";
   const normalized = path.replace(/\\/g, "/");
-  const found = instructionTemplates.find((item) => normalized.endsWith(item.filename));
+  const found = templates.find((item) => normalized.toLowerCase().endsWith(item.filename.toLowerCase()));
   return found?.id || "custom";
+}
+
+function normalizedProviderToml(text?: string) {
+  return (text || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .filter((line) => !/^\s*experimental_bearer_token\s*=/.test(line))
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
 }
 
 function JsonPreview({ text }: { text: string }) {
@@ -875,6 +885,9 @@ function App() {
   const [visitedTabs, setVisitedTabs] = React.useState<Set<Tab>>(() => new Set(["dashboard"]));
   const [providerMode, setProviderMode] = React.useState<ProviderMode>("list");
   const [instructionMode, setInstructionMode] = React.useState<InstructionMode>("list");
+  const [promptInjectionMode, setPromptInjectionMode] = React.useState<PromptInjectionMode>(() =>
+    localStorage.getItem(PROMPT_INJECTION_MODE_KEY) === "replace" ? "replace" : "append",
+  );
   const [skillsMcpTab, setSkillsMcpTab] = React.useState<"mcp" | "skills">("mcp");
   const [editingProviderId, setEditingProviderId] = React.useState<string | null>(null);
   const [editingPromptId, setEditingPromptId] = React.useState<string | null>(null);
@@ -899,7 +912,6 @@ function App() {
   const [autoSessionSync, setAutoSessionSync] = React.useState(() => localStorage.getItem(AUTO_SESSION_SYNC_KEY) === "1");
   const [autoSessionSyncBusy, setAutoSessionSyncBusy] = React.useState(false);
   const [state, setState] = React.useState<CodexState | null>(null);
-  const [backups, setBackups] = React.useState<BackupEntry[]>([]);
   const [configDir, setConfigDir] = React.useState("");
   const [loading, setLoading] = React.useState(false);
   const [bootVisible, setBootVisible] = React.useState(true);
@@ -915,16 +927,24 @@ function App() {
   const [actionBusy, setActionBusy] = React.useState<string>("");
   const [promptForm, setPromptForm] = React.useState<SavedPrompt>(blankPromptForm);
   const [officialForm, setOfficialForm] = React.useState({ model: "gpt-5.5", authJson: "" });
+  const [promptModeHelpOpen, setPromptModeHelpOpen] = React.useState(false);
   const autoUpdateCheckedRef = React.useRef(false);
   const autoSessionSyncRanRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
   const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
-  const promptUpdateCheckedRef = React.useRef(false);
+  const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const promptModeHelpRef = React.useRef<HTMLDivElement | null>(null);
+  const promptUpdateCheckedRef = React.useRef(0);
+  const promptModeSyncedRef = React.useRef("");
   const skillsMcpLoadedRef = React.useRef(false);
   const bootStartedAtRef = React.useRef(Date.now());
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
-  const currentInstructionId = instructionIdFromPath(state?.instructionFile);
+  const instructionTemplates = React.useMemo<InstructionTemplate[]>(() => {
+    if (!builtinPromptStatus.length) return bundledInstructionTemplates;
+    return builtinPromptStatus.map(({ id, filename, title, subtitle, badge }) => ({ id, filename, title, subtitle, badge }));
+  }, [builtinPromptStatus]);
+  const currentInstructionId = instructionIdFromPath(state?.instructionFile, instructionTemplates);
   const builtinPromptStatusMap = React.useMemo(() => new Map(builtinPromptStatus.map((item) => [item.id, item])), [builtinPromptStatus]);
   const releaseStatusLabel = React.useMemo(() => {
     if (releaseInfo.status === "checking") return lang === "zh" ? "检查中" : "Checking";
@@ -937,6 +957,44 @@ function App() {
   React.useEffect(() => {
     localStorage.setItem(LANG_KEY, lang);
   }, [lang]);
+
+  React.useEffect(() => {
+    localStorage.setItem(PROMPT_INJECTION_MODE_KEY, promptInjectionMode);
+  }, [promptInjectionMode]);
+
+  React.useEffect(() => {
+    if (!promptModeHelpOpen) return undefined;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && promptModeHelpRef.current?.contains(target)) return;
+      setPromptModeHelpOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPromptModeHelpOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [promptModeHelpOpen]);
+
+  React.useLayoutEffect(() => {
+    if (providerMode !== "form") return;
+    const editor = providerTomlEditorRef.current;
+    if (!editor) return;
+    editor.style.height = "0px";
+    editor.style.height = `${Math.max(560, editor.scrollHeight)}px`;
+  }, [providerMode, providerTomlDraft]);
+
+  React.useEffect(() => {
+    if (!state || promptModeSyncedRef.current === state.codexDir) return;
+    promptModeSyncedRef.current = state.codexDir;
+    if (state.instructionInjectionMode) {
+      setPromptInjectionMode(state.instructionInjectionMode);
+    }
+  }, [state]);
 
   React.useEffect(() => {
     setVisitedTabs((tabs) => {
@@ -978,20 +1036,59 @@ function App() {
   const liveProviderId = (state?.modelProvider || "openai").trim();
   const liveCustomProvider = React.useMemo(() => (state?.providers || []).find((item) => item.id === "custom"), [state?.providers]);
   const inferredActiveProviderId = React.useMemo(() => {
-    if (liveProviderId !== "custom" || activeProviderId) return activeProviderId;
+    if (liveProviderId !== "custom") return "";
+    if (state?.activeSavedProviderId && savedProviders.some((item) => item.id === state.activeSavedProviderId)) {
+      return state.activeSavedProviderId;
+    }
+    const liveToml = normalizedProviderToml(state?.configText);
+    const exactTomlMatches = liveToml
+      ? savedProviders.filter((item) => item.tomlConfig && normalizedProviderToml(item.tomlConfig) === liveToml)
+      : [];
+    if (exactTomlMatches.length) {
+      const rememberedExact = exactTomlMatches.find((item) => item.id === activeProviderId);
+      return rememberedExact?.id || exactTomlMatches[0].id;
+    }
     const liveBaseUrl = (liveCustomProvider?.baseUrl || "").replace(/\/+$/, "");
     const liveWireApi = liveCustomProvider?.wireApi || "responses";
     const liveModel = state?.model || "";
-    const matched = savedProviders.find((item) =>
+    const identityMatches = savedProviders.filter((item) =>
       item.baseUrl.replace(/\/+$/, "") === liveBaseUrl &&
       (item.model || "") === liveModel &&
       (item.wireApi || "responses") === liveWireApi,
     );
-    return matched?.id || "";
-  }, [activeProviderId, liveCustomProvider?.baseUrl, liveCustomProvider?.wireApi, liveProviderId, savedProviders, state?.model]);
+    const remembered = identityMatches.find((item) => item.id === activeProviderId);
+    if (remembered) return remembered.id;
+    return identityMatches.length === 1 ? identityMatches[0].id : "";
+  }, [activeProviderId, liveCustomProvider?.baseUrl, liveCustomProvider?.wireApi, liveProviderId, savedProviders, state?.activeSavedProviderId, state?.configText, state?.model]);
   const effectiveActiveProviderId = liveProviderId === "custom" ? inferredActiveProviderId : liveProviderId;
   const currentInstructionPath = (state?.instructionFile || "").replace(/\\/g, "/");
   const currentInstructionFilename = currentInstructionPath.split("/").pop() || "";
+  const activeInstructionTitle = React.useMemo(() => {
+    const templateKey = state?.instructionTemplateKey || "";
+    if (templateKey.startsWith("builtin:")) {
+      const id = templateKey.slice("builtin:".length);
+      return instructionTemplates.find((item) => item.id === id)?.title || id;
+    }
+    if (templateKey.startsWith("saved:")) {
+      const id = templateKey.slice("saved:".length);
+      return savedPrompts.find((item) => item.id === id)?.title || id;
+    }
+    return savedPrompts.find((item) => item.filename === currentInstructionFilename)?.title
+      || instructionTemplates.find((item) => item.filename === currentInstructionFilename)?.title
+      || currentInstructionFilename
+      || (lang === "zh" ? "当前提示词" : "Current prompt");
+  }, [currentInstructionFilename, instructionTemplates, lang, savedPrompts, state?.instructionTemplateKey]);
+  const activeInjectionModeLabel = state?.instructionInjectionMode === "append"
+    ? (lang === "zh" ? "追加到 AGENTS.md" : "Append to AGENTS.md")
+    : (lang === "zh" ? "替换指令文件" : "Replace instruction file");
+  const selectedInjectionModeLabel = promptInjectionMode === "append"
+    ? (lang === "zh" ? "保留原提示词" : "Keep existing")
+    : (lang === "zh" ? "替换原提示词" : "Replace existing");
+  const injectionModePending = Boolean(
+    state?.instructionEnabled
+      && state.instructionInjectionMode
+      && state.instructionInjectionMode !== promptInjectionMode,
+  );
   const detectedRows = React.useMemo(() => {
     return (state?.providers || []).map((p) => ({
       id: `detected-${p.id}`,
@@ -1032,13 +1129,14 @@ function App() {
       rows.push(row);
     });
     detectedRows.forEach((row) => {
+      if (row.id === "detected-custom" && inferredActiveProviderId) return;
       const key = `${row.baseUrl}::${row.model}`;
       if (key !== "::" && seen.has(key)) return;
       if (key !== "::") seen.add(key);
       rows.push(row);
     });
     return rows;
-  }, [detectedRows, localRows, state?.model, state?.modelProvider]);
+  }, [detectedRows, inferredActiveProviderId, localRows, state?.model, state?.modelProvider]);
 
   const filteredSessions = React.useMemo(() => {
     const query = deferredSessionQuery.trim().toLowerCase();
@@ -1115,12 +1213,10 @@ function App() {
         const resolvedConfigDir = configDir || next.codexDir || null;
         void Promise.all([
           invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: resolvedConfigDir }),
-          invoke<BackupEntry[]>("list_backups"),
           invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null }),
         ])
-          .then(([diagnostics, backupList, sessions]) => {
+          .then(([diagnostics, sessions]) => {
             setStartupDiagnostics(diagnostics);
-            setBackups(backupList);
             setSessionStatus(sessions);
           })
           .catch(() => undefined);
@@ -1147,11 +1243,16 @@ function App() {
       return;
     }
     if (!savedProviders.length) return;
+    if (inferredActiveProviderId && inferredActiveProviderId !== activeProviderId) {
+      localStorage.setItem(ACTIVE_PROVIDER_KEY, inferredActiveProviderId);
+      setActiveProviderId(inferredActiveProviderId);
+      return;
+    }
     if (activeProviderId && !savedProviders.some((item) => item.id === activeProviderId)) {
       localStorage.removeItem(ACTIVE_PROVIDER_KEY);
       setActiveProviderId("");
     }
-  }, [activeProviderId, liveProviderId, savedProviders, state]);
+  }, [activeProviderId, inferredActiveProviderId, liveProviderId, savedProviders, state]);
 
   React.useEffect(() => {
     if (!autoSessionSync || autoSessionSyncRanRef.current || !state?.codexDir) return;
@@ -1179,13 +1280,11 @@ function App() {
     setToast(result.message);
     const resolvedConfigDir = configDir || result.state.codexDir || null;
     void Promise.all([
-      invoke<BackupEntry[]>("list_backups"),
       invoke<SavedPrompt[]>("list_saved_prompts"),
       invoke<SavedProvider[]>("list_saved_providers"),
       invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null }),
     ])
-      .then(([backupList, promptList, providerList, sessions]) => {
-        setBackups(backupList);
+      .then(([promptList, providerList, sessions]) => {
         setSavedPrompts(promptList);
         setSavedProviders(providerList);
         setSessionStatus(sessions);
@@ -1193,18 +1292,21 @@ function App() {
       .catch(() => undefined);
   };
 
-  const enableInstruction = () =>
-    call(() => invoke<ActionResult>("enable_instruction", { configDir: configDir || null }), handleActionResult);
-
   const switchInstructionTemplate = (templateId: string) =>
     call(
-      () => invoke<ActionResult>("enable_instruction_template", { configDir: configDir || null, templateId }),
+      () => invoke<ActionResult>("enable_instruction_template", { configDir: configDir || null, templateId, injectionMode: promptInjectionMode }),
       handleActionResult,
     );
 
   const disableInstruction = () =>
     call(
       () => invoke<ActionResult>("disable_instruction", { configDir: configDir || null, deleteFile: true }),
+      handleActionResult,
+    );
+
+  const disableExternalInstruction = () =>
+    call(
+      () => invoke<ActionResult>("disable_external_instruction", { configDir: configDir || null }),
       handleActionResult,
     );
 
@@ -1251,7 +1353,7 @@ function App() {
     call(
       async () => {
         const saved = await invoke<SavedPrompt>("save_prompt", { prompt: normalizedPromptForm() });
-        const result = await invoke<ActionResult>("enable_saved_prompt", { configDir: configDir || null, id: saved.id });
+        const result = await invoke<ActionResult>("enable_saved_prompt", { configDir: configDir || null, id: saved.id, injectionMode: promptInjectionMode });
         return result;
       },
       (result) => {
@@ -1262,7 +1364,7 @@ function App() {
     );
 
   const enableSavedPrompt = (id: string) =>
-    call(() => invoke<ActionResult>("enable_saved_prompt", { configDir: configDir || null, id }), handleActionResult);
+    call(() => invoke<ActionResult>("enable_saved_prompt", { configDir: configDir || null, id, injectionMode: promptInjectionMode }), handleActionResult);
 
   const removeSavedPrompt = (id: string) =>
     call(
@@ -1317,11 +1419,15 @@ function App() {
     try {
       const list = await invoke<BuiltinPromptStatus[]>("refresh_builtin_prompts");
       setBuiltinPromptStatus(list);
+      promptUpdateCheckedRef.current = Date.now();
       const updated = list.filter((item) => item.updated).length;
+      const catalogFailed = list.some((item) => item.message.includes("无法读取 GitHub 模板目录"));
       if (!quiet) {
-        setToast(updated > 0
-          ? (lang === "zh" ? `已更新 ${updated} 个内置提示词模板` : `${updated} built-in prompt template(s) updated`)
-          : (lang === "zh" ? "内置提示词已是 GitHub 最新" : "Built-in prompts are up to date"));
+        setToast(catalogFailed
+          ? (lang === "zh" ? "暂时无法连接 GitHub，已使用本地模板" : "GitHub unavailable; using local templates")
+          : updated > 0
+            ? (lang === "zh" ? `已同步 ${updated} 个 GitHub 提示词模板` : `${updated} GitHub prompt template(s) synced`)
+            : (lang === "zh" ? "提示词模板已是 GitHub 最新" : "Prompt templates are up to date"));
       }
     } catch (e) {
       if (!quiet) setError(String(e));
@@ -1441,9 +1547,6 @@ function App() {
       },
     );
 
-  const restoreBackup = (backupId: string) =>
-    call(() => invoke<ActionResult>("restore_backup", { configDir: configDir || null, backupId }), handleActionResult);
-
   const openExternalUrl = React.useCallback((url?: string | null) => {
     if (!url) return;
     window.setTimeout(() => {
@@ -1513,8 +1616,8 @@ function App() {
   }, [state, aboutInfo, checkForUpdates]);
 
   React.useEffect(() => {
-    if (tab !== "instruction" || promptUpdateCheckedRef.current) return;
-    promptUpdateCheckedRef.current = true;
+    if (tab !== "instruction" || Date.now() - promptUpdateCheckedRef.current < 60_000) return;
+    promptUpdateCheckedRef.current = Date.now();
     const run = () => void refreshBuiltinPrompts({ quiet: true });
     const timer = window.setTimeout(() => {
       if ("requestIdleCallback" in window) {
@@ -2083,7 +2186,7 @@ function App() {
                 <StatCard icon={<Sparkles size={20} />} label={t.dashboard.instruction} value={state.instructionEnabled ? t.dashboard.enabled : t.dashboard.disabled} ok={state.instructionEnabled} />
                 <StatCard icon={<KeyRound size={20} />} label={t.dashboard.auth} value={state.authExists ? t.authJson : t.noAuth} ok={state.authExists} />
 
-                <section className="panel glass wide">
+                <section className="panel glass dashboard-config-panel">
                   <div className="panel-head">
                     <div>
                       <p className="eyebrow">{t.dashboard.liveStatus}</p>
@@ -2096,18 +2199,10 @@ function App() {
                     <div><span>{t.dashboard.configPath}</span><code>{state.configPath}</code></div>
                     <div><span>{t.dashboard.model}</span><code>{state.model || t.dashboard.notSet}</code></div>
                     <div><span>{t.dashboard.providerName}</span><code>{state.modelProvider || t.dashboard.officialDefault}</code></div>
-                    <div><span>{t.dashboard.instructionFile}</span><code>{state.instructionFile || t.dashboard.notSet}</code></div>
+                    <div><span>{t.dashboard.instructionFile}</span><code>{state.instructionInjectionMode === "append" ? `${state.agentsPath} (${lang === "zh" ? "追加模式" : "append"})` : (state.instructionFile || t.dashboard.notSet)}</code></div>
                   </div>
                 </section>
 
-                <section className="panel glass">
-                  <div className="panel-head compact"><h3>{t.dashboard.quickActions}</h3></div>
-                  <div className="action-stack">
-                    <button className="primary-btn big" onClick={enableInstruction} disabled={loading}><Power size={18} /> {t.dashboard.enableInstruction}</button>
-                    <button className="secondary-btn big" onClick={disableInstruction} disabled={loading}><RotateCcw size={18} /> {t.dashboard.disableInstruction}</button>
-                    {backups[0] && <button className="ghost-btn big" onClick={() => restoreBackup(backups[0].id)} disabled={loading}><History size={18} /> {t.dashboard.restoreLatest}</button>}
-                  </div>
-                </section>
               </div>
               </>
             )}
@@ -2277,6 +2372,7 @@ function App() {
                           <button className="ghost-btn small" onClick={() => { setProviderTomlDraft(providerTomlPreview); setProviderTomlDirty(false); }}>{lang === "zh" ? "重置生成" : "Reset"}</button>
                         </div>
                         <textarea
+                          ref={providerTomlEditorRef}
                           className="provider-toml-editor"
                           value={providerTomlDraft}
                           onChange={(e) => { setProviderTomlDraft(e.target.value); setProviderTomlDirty(true); }}
@@ -2561,7 +2657,7 @@ function App() {
                   <>
                     <div className="panel-head provider-title-row">
                       <div>
-                        <p className="eyebrow">model_instructions_file</p>
+                        <p className="eyebrow">Prompt injection</p>
                         <h3>{t.instruction.title}</h3>
                       </div>
                       <div className="provider-title-actions">
@@ -2573,7 +2669,7 @@ function App() {
                           onChange={(e) => void importPromptMd(e.target.files?.[0])}
                         />
                         <button className="ghost-btn add-provider-btn lively-btn" onClick={() => void refreshBuiltinPrompts()} disabled={loading || actionBusy === "refreshPrompts"}>
-                          {actionBusy === "refreshPrompts" ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />} {actionBusy === "refreshPrompts" ? (lang === "zh" ? "更新中..." : "Updating...") : (lang === "zh" ? "更新内置模板" : "Update built-ins")}
+                          {actionBusy === "refreshPrompts" ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />} {actionBusy === "refreshPrompts" ? (lang === "zh" ? "同步中..." : "Syncing...") : (lang === "zh" ? "同步 GitHub 模板" : "Sync GitHub templates")}
                         </button>
                         <button className="secondary-btn add-provider-btn lively-btn" onClick={() => promptImportRef.current?.click()} disabled={loading}>
                           {actionBusy === "importPrompt" ? <Loader2 size={18} className="spin" /> : <Upload size={18} />} {actionBusy === "importPrompt" ? (lang === "zh" ? "导入中..." : "Importing...") : (lang === "zh" ? "导入 md" : "Import md")}
@@ -2582,14 +2678,87 @@ function App() {
                       </div>
                     </div>
 
+                    <div className="prompt-injection-mode-bar">
+                      <div className="prompt-active-summary">
+                        <span className="prompt-mode-label">{lang === "zh" ? "当前状态" : "Current status"}</span>
+                        <div className="prompt-active-line">
+                          <span className={cx("prompt-state-dot", state.instructionEnabled && "on")} />
+                          <strong>{state.instructionEnabled ? activeInstructionTitle : (lang === "zh" ? "未启用提示词" : "No prompt enabled")}</strong>
+                          {state.instructionEnabled && <span className="prompt-current-mode">{activeInjectionModeLabel}</span>}
+                        </div>
+                        <span className="prompt-active-detail">
+                          {state.instructionEnabled
+                            ? state.instructionInjectionMode === "append"
+                              ? (lang === "zh" ? "当前模板写入 AGENTS.md，同时保留已有指令文件。" : "The active template is in AGENTS.md while the existing instruction file is preserved.")
+                              : (lang === "zh" ? "当前模板通过 model_instructions_file 独立加载。" : "The active template is loaded through model_instructions_file.")
+                            : (lang === "zh" ? "先选择启用方式，再打开下方任一模板。" : "Choose an enable method, then turn on a template below.")}
+                        </span>
+                      </div>
+                      <div className="prompt-mode-choice">
+                        <div className="prompt-mode-copy">
+                          <div className="prompt-mode-title-row" ref={promptModeHelpRef}>
+                            <strong>{lang === "zh" ? "启用方式" : "Enable method"}</strong>
+                            <button
+                              type="button"
+                              className="prompt-mode-help-btn"
+                              aria-label={lang === "zh" ? "查看启用方式说明" : "Show enable method help"}
+                              aria-expanded={promptModeHelpOpen}
+                              onClick={() => setPromptModeHelpOpen((open) => !open)}
+                            >
+                              <CircleHelp size={15} />
+                            </button>
+                            {promptModeHelpOpen && (
+                              <div className="prompt-mode-help-popover" role="dialog" aria-label={lang === "zh" ? "启用方式说明" : "Enable method details"}>
+                                <div className="prompt-mode-help-item">
+                                  <strong>{lang === "zh" ? "保留原提示词" : "Keep existing"}</strong>
+                                  <span>{lang === "zh" ? "只在 AGENTS.md 里增加 Codex-X 管理区块，不会改动你原本的 model_instructions_file，也不会碰你已经配置好的系统提示词。适合想叠加使用、又不想影响原有环境的人。" : "Adds only a Codex-X managed block in AGENTS.md. Your existing model_instructions_file and configured system prompt stay untouched. Best when you want an overlay without disturbing the current setup."}</span>
+                                </div>
+                                <div className="prompt-mode-help-item">
+                                  <strong>{lang === "zh" ? "替换原提示词" : "Replace existing"}</strong>
+                                  <span>{lang === "zh" ? "会直接改写 model_instructions_file，当前选中的模板会成为唯一生效的指令入口。它更干净，但也意味着原来依赖的其他提示词内容会被覆盖，可能让效果变得更单一。" : "Rewrites model_instructions_file so the selected template becomes the only active instruction source. It is cleaner, but any other prompt content you relied on will be replaced, which can make behavior more narrow."}</span>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                          <span>
+                            {injectionModePending
+                              ? (lang === "zh" ? `当前模式不变；下次启用将使用“${selectedInjectionModeLabel}”。` : `Current mode is unchanged; the next enable uses “${selectedInjectionModeLabel}”.`)
+                              : (lang === "zh" ? "点击下方模板开关时，使用这里选择的方式。" : "This method is used when you turn on a template below.")}
+                          </span>
+                        </div>
+                        <div className="prompt-mode-segments" role="radiogroup" aria-label={lang === "zh" ? "提示词启用方式" : "Prompt enable method"}>
+                          <button
+                            className={cx(promptInjectionMode === "append" && "active")}
+                            role="radio"
+                            aria-checked={promptInjectionMode === "append"}
+                            title={lang === "zh" ? "写入 AGENTS.md，并保留现有 model_instructions_file" : "Write to AGENTS.md and preserve model_instructions_file"}
+                            onClick={() => setPromptInjectionMode("append")}
+                          >
+                            {lang === "zh" ? "保留原提示词" : "Keep existing"}
+                          </button>
+                          <button
+                            className={cx(promptInjectionMode === "replace" && "active")}
+                            role="radio"
+                            aria-checked={promptInjectionMode === "replace"}
+                            title={lang === "zh" ? "使用 model_instructions_file 替换现有指令文件" : "Replace the existing instruction file through model_instructions_file"}
+                            onClick={() => setPromptInjectionMode("replace")}
+                          >
+                            {lang === "zh" ? "替换原提示词" : "Replace existing"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
                     <div className="skills-mcp-simple-list instruction-switch-list">
                       {instructionTemplates.map((item) => {
-                        const isCurrent = currentInstructionId === item.id;
+                        const isCurrent = state.instructionTemplateKey === `builtin:${item.id}`;
                         const remoteStatus = builtinPromptStatusMap.get(item.id);
                         const sourceLabel = remoteStatus?.contentSource === "github"
                           ? (lang === "zh" ? "GitHub 最新" : "GitHub latest")
                           : remoteStatus?.contentSource === "cache"
                             ? (lang === "zh" ? "本地缓存" : "Local cache")
+                            : remoteStatus?.contentSource === "unavailable"
+                              ? (lang === "zh" ? "下载失败" : "Unavailable")
                             : (lang === "zh" ? "打包内置" : "Bundled");
                         return (
                           <article className={cx("skills-mcp-simple-row instruction-switch-row", isCurrent && "selected")} key={item.id}>
@@ -2597,6 +2766,7 @@ function App() {
                               <strong>{item.title}</strong>
                               <p>{item.subtitle}</p>
                               <div className="prompt-remote-meta" title={remoteStatus?.message || undefined}>
+                                {isCurrent && <span className="mini-tag current-mode">{lang === "zh" ? `当前 · ${activeInjectionModeLabel}` : `Current · ${activeInjectionModeLabel}`}</span>}
                                 <span className={cx("mini-tag", remoteStatus?.contentSource === "github" ? "ok" : undefined)}>{sourceLabel}</span>
                                 {remoteStatus?.checkedAt && <small>{new Date(remoteStatus.checkedAt).toLocaleString()}</small>}
                               </div>
@@ -2614,18 +2784,37 @@ function App() {
                       })}
 
                       {savedPrompts.map((prompt) => {
-                        const isCurrent = Boolean(currentInstructionFilename) && currentInstructionFilename === prompt.filename;
+                        const isManagedCurrent = state.instructionTemplateKey === `saved:${prompt.id}`;
+                        const isPreservedExternal = state.instructionInjectionMode === "append"
+                          && Boolean(currentInstructionFilename)
+                          && currentInstructionFilename === prompt.filename;
+                        const isCurrent = isManagedCurrent || isPreservedExternal;
                         return (
                           <article className={cx("skills-mcp-simple-row instruction-switch-row", isCurrent && "selected")} key={prompt.id}>
                             <div className="instruction-main">
                               <strong>{prompt.title}</strong>
-                              <p>{lang === "zh" ? "自定义指令提示词" : "Custom instruction prompt"}</p>
+                              <p>{isPreservedExternal
+                                ? (lang === "zh" ? "用户原有提示词，追加模式下继续生效" : "Existing user prompt preserved by append mode")
+                                : (lang === "zh" ? "自定义指令提示词" : "Custom instruction prompt")}</p>
+                              {isManagedCurrent && (
+                                <div className="prompt-remote-meta">
+                                  <span className="mini-tag current-mode">{lang === "zh" ? `当前 · ${activeInjectionModeLabel}` : `Current · ${activeInjectionModeLabel}`}</span>
+                                </div>
+                              )}
                             </div>
                             <div className="instruction-icon-actions">
                               <button
                                 className={cx("switch-toggle", isCurrent && "on")}
-                                title={isCurrent ? (lang === "zh" ? "关闭" : "Disable") : (lang === "zh" ? "启用" : "Enable")}
-                                onClick={() => isCurrent ? disableInstruction() : enableSavedPrompt(prompt.id)}
+                                title={isManagedCurrent
+                                  ? (lang === "zh" ? "关闭" : "Disable")
+                                  : isPreservedExternal
+                                    ? (lang === "zh" ? "禁用外部提示词" : "Disable external prompt")
+                                    : (lang === "zh" ? "启用" : "Enable")}
+                                onClick={() => isManagedCurrent
+                                  ? disableInstruction()
+                                  : isPreservedExternal
+                                    ? disableExternalInstruction()
+                                    : enableSavedPrompt(prompt.id)}
                                 disabled={loading}
                               >
                                 <span />
@@ -2640,10 +2829,12 @@ function App() {
                       {state.instructionFile && currentInstructionId === "custom" && !savedPrompts.some((p) => currentInstructionFilename === p.filename) && (
                         <article className="skills-mcp-simple-row instruction-switch-row selected">
                           <div className="instruction-main">
-                            <strong>{lang === "zh" ? "当前自定义指令提示词" : "Current custom prompt"}</strong>
-                            <p>{lang === "zh" ? "当前使用的是外部提示词；切换到内置模板前会自动保存到下方列表，之后仍可重新启用。" : "An external prompt is currently active. It will be saved before switching to a built-in template so you can enable it again later."}</p>
+                            <strong>{lang === "zh" ? "用户原有指令提示词" : "Existing user prompt"}</strong>
+                            <p>{state.instructionInjectionMode === "append"
+                              ? (lang === "zh" ? "追加模式已保留这份外部提示词，并同时加载 Codex-X 的 AGENTS.md 区块。" : "Append mode preserves this external prompt alongside the Codex-X AGENTS.md block.")
+                              : (lang === "zh" ? "当前使用的是非 Codex-X 管理的外部提示词。" : "This external prompt is not managed by Codex-X.")}</p>
                           </div>
-                          <button className="switch-toggle on" title={lang === "zh" ? "关闭" : "Disable"} onClick={disableInstruction} disabled={loading}><span /></button>
+                          <button className="switch-toggle on" title={lang === "zh" ? "禁用外部提示词" : "Disable external prompt"} onClick={disableExternalInstruction} disabled={loading}><span /></button>
                         </article>
                       )}
                     </div>
@@ -2698,7 +2889,7 @@ function App() {
                   </div>
                   <div className="about-kv">
                     <div><span>Codex-X {lang === "zh" ? "版本" : "Version"}</span><strong>{aboutInfo?.appVersion || "0.2.0"}</strong></div>
-                    <div><span>Codex {lang === "zh" ? "版本" : "Version"}</span><strong>{aboutInfo?.codexVersion || (lang === "zh" ? "未检测到" : "Not detected")}</strong></div>
+                    <div><span>Codex CLI {lang === "zh" ? "版本" : "Version"}</span><strong>{aboutInfo?.codexVersion || (lang === "zh" ? "未检测到" : "Not detected")}</strong></div>
                     <div><span>CODEX_HOME</span><code>{aboutInfo?.codexDir || state.codexDir}</code></div>
                     <div><span>{lang === "zh" ? "项目地址" : "Project"}</span><code>{aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}</code></div>
                   </div>
