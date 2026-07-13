@@ -52,6 +52,40 @@ function liveEventPrefix(repository) {
   return `live-event:${repository.toLowerCase()}:`;
 }
 
+function configuredCamoUrls(env, repository) {
+  const requested = repository.toLowerCase();
+  for (const item of String(env.CAMO_PURGE_URLS || "").split(",")) {
+    const [configuredRepository, ...values] = item.split("|");
+    if (configuredRepository?.trim().toLowerCase() !== requested) continue;
+    return values.flatMap((value) => {
+      try {
+        const url = new URL(value.trim());
+        return url.protocol === "https:" && url.hostname === "camo.githubusercontent.com"
+          ? [url.toString()]
+          : [];
+      } catch {
+        return [];
+      }
+    });
+  }
+  return [];
+}
+
+async function purgeCamoUrls(env, repository) {
+  const urls = configuredCamoUrls(env, repository);
+  const results = await Promise.allSettled(urls.map(async (url) => {
+    const response = await fetch(url, { method: "PURGE" });
+    if (!response.ok) throw new Error(`Camo PURGE returned ${response.status}`);
+  }));
+  const failures = results.filter((result) => result.status === "rejected");
+  if (failures.length) console.warn("Camo purge failed", repository, failures.length);
+}
+
+function scheduleCamoPurge(context, env, repository) {
+  if (typeof context?.waitUntil !== "function") return;
+  context.waitUntil(purgeCamoUrls(env, repository));
+}
+
 async function loadDatasetWithLiveEvents(env, repository) {
   const dataset = await env.STAR_HISTORY.get(datasetKey(repository), "json");
   if (!dataset?.baseline?.length) return dataset;
@@ -205,7 +239,7 @@ async function serveChart(request, env, chart) {
   return new Response(request.method === "HEAD" ? null : svg, { status: 200, headers });
 }
 
-async function handleRefresh(request, env) {
+async function handleRefresh(request, env, context) {
   if (!(await authorizeRefresh(request, env))) return jsonResponse({ error: "Unauthorized" }, 401);
   const payload = await request.json().catch(() => null);
   const repository = allowedRepository(env, payload?.repository);
@@ -213,6 +247,7 @@ async function handleRefresh(request, env) {
 
   try {
     const dataset = await ingestRepositorySnapshot(env, repository, payload, payload?.rebuild === true);
+    scheduleCamoPurge(context, env, repository);
     return jsonResponse({
       ok: true,
       repository,
@@ -231,7 +266,7 @@ async function handleRefresh(request, env) {
   }
 }
 
-async function handleWebhook(request, env) {
+async function handleWebhook(request, env, context) {
   let rawBody;
   try {
     rawBody = await readTextWithLimit(request, MAX_WEBHOOK_BYTES);
@@ -270,6 +305,7 @@ async function handleWebhook(request, env) {
       observedAt,
     },
   });
+  scheduleCamoPurge(context, env, repository);
   return jsonResponse({ accepted: true, repository, stars: currentStars }, 202);
 }
 
@@ -293,7 +329,7 @@ async function handleHealth(env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, context) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") {
       return new Response(null, {
@@ -306,8 +342,8 @@ export default {
       });
     }
 
-    if (request.method === "POST" && url.pathname === "/v1/refresh") return handleRefresh(request, env);
-    if (request.method === "POST" && url.pathname === "/v1/github/webhook") return handleWebhook(request, env);
+    if (request.method === "POST" && url.pathname === "/v1/refresh") return handleRefresh(request, env, context);
+    if (request.method === "POST" && url.pathname === "/v1/github/webhook") return handleWebhook(request, env, context);
     if (request.method === "GET" && url.pathname === "/healthz") return handleHealth(env);
 
     const chart = parseChartRequest(url, env);

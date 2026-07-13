@@ -130,6 +130,52 @@ test("refresh reconciles an existing baseline without Stargazer details", async 
   assert.equal(stored.snapshots.at(-1).count, 11);
 });
 
+test("successful refresh schedules GitHub Camo purges", async () => {
+  const env = testEnv(baseline("2026-01-02T00:00:00Z"));
+  env.CAMO_PURGE_URLS = [
+    "yynxxxxx/Codex-X",
+    "https://camo.githubusercontent.com/dark/chart",
+    "https://camo.githubusercontent.com/light/chart",
+  ].join("|");
+  const payload = {
+    repository: "yynxxxxx/Codex-X",
+    createdAt: "2026-01-01T00:00:00Z",
+    checkedAt: "2026-01-03T00:00:00Z",
+    currentStars: 11,
+  };
+  const purged = [];
+  let backgroundTask;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    purged.push({ url: String(url), method: options?.method });
+    return new Response(null, { status: 200 });
+  };
+
+  try {
+    const response = await worker.fetch(new Request("https://example.test/v1/refresh", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.INGEST_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }), env, {
+      waitUntil(task) {
+        backgroundTask = task;
+      },
+    });
+    assert.equal(response.status, 200);
+    await backgroundTask;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(purged, [
+    { url: "https://camo.githubusercontent.com/dark/chart", method: "PURGE" },
+    { url: "https://camo.githubusercontent.com/light/chart", method: "PURGE" },
+  ]);
+});
+
 test("webhook events use unique keys and duplicate deliveries stay idempotent", async () => {
   const env = testEnv(baseline("2026-01-02T00:00:00Z"));
   const payload = JSON.stringify({
