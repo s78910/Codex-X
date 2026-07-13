@@ -205,6 +205,17 @@ type SessionSyncResult = {
   backupDir: string;
 };
 
+type SessionDeleteResult = {
+  status: SessionSyncStatus;
+  requestedSessions: number;
+  deletedSessions: number;
+  failedSessions: number;
+  failureMessage?: string | null;
+  deletedThreadRows: number;
+  deletedRolloutFiles: number;
+  deletedRelatedRows: number;
+};
+
 type ManagedSkill = {
   id: string;
   name: string;
@@ -939,8 +950,11 @@ function App() {
   const [startupClosing, setStartupClosing] = React.useState(false);
   const [sessionQuery, setSessionQuery] = React.useState("");
   const deferredSessionQuery = React.useDeferredValue(sessionQuery);
-  const [sessionGroupByCwd, setSessionGroupByCwd] = React.useState(true);
+  const [sessionGroupByCwd, setSessionGroupByCwd] = React.useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = React.useState<string[]>([]);
+  const [sessionDeleteConfirmOpen, setSessionDeleteConfirmOpen] = React.useState(false);
+  const [sessionDeleteBusy, setSessionDeleteBusy] = React.useState(false);
+  const [sessionDeleteSafetyConfirmed, setSessionDeleteSafetyConfirmed] = React.useState(false);
   const [autoSessionSync, setAutoSessionSync] = React.useState(() => localStorage.getItem(AUTO_SESSION_SYNC_KEY) === "1");
   const [autoSessionSyncBusy, setAutoSessionSyncBusy] = React.useState(false);
   const [state, setState] = React.useState<CodexState | null>(null);
@@ -968,6 +982,9 @@ function App() {
   const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
   const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const promptModeHelpRef = React.useRef<HTMLDivElement | null>(null);
+  const sessionDeleteDialogRef = React.useRef<HTMLDivElement | null>(null);
+  const sessionDeleteTriggerRef = React.useRef<HTMLButtonElement | null>(null);
+  const sessionDeleteBusyRef = React.useRef(false);
   const promptRefreshRequestRef = React.useRef(0);
   const promptRefreshInFlightRef = React.useRef<Promise<BuiltinPromptStatus[]> | null>(null);
   const promptAutoRefreshStartedRef = React.useRef(false);
@@ -1193,6 +1210,16 @@ function App() {
       .some((value) => String(value).toLowerCase().includes(query)));
   }, [deferredSessionQuery, sessionStatus?.sessions]);
 
+  const allSessionsByCwd = React.useMemo(() => {
+    const groups = new Map<string, SessionPreview[]>();
+    for (const item of sessionStatus?.sessions || []) {
+      const key = item.cwd || (lang === "zh" ? "未记录工作目录" : "No workspace recorded");
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(item);
+    }
+    return groups;
+  }, [lang, sessionStatus?.sessions]);
+
   const groupedSessions = React.useMemo(() => {
     const groups = new Map<string, SessionPreview[]>();
     if (!sessionGroupByCwd) {
@@ -1208,11 +1235,12 @@ function App() {
   }, [filteredSessions, lang, sessionGroupByCwd]);
 
   const unsyncedChatCount = Math.max(sessionStatus?.mismatchedThreads ?? 0, sessionStatus?.mismatchedSessionMeta ?? 0);
+  const sessionPreviewTruncated = (sessionStatus?.sqliteThreads ?? 0) > (sessionStatus?.sessions.length ?? 0);
   const selectedSessionSet = React.useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
-  const selectedNeedsSyncCount = React.useMemo(() => {
-    const set = new Set(selectedSessionIds);
-    return (sessionStatus?.sessions || []).filter((item) => set.has(item.id) && item.needsSync).length;
-  }, [selectedSessionIds, sessionStatus?.sessions]);
+  const selectedSessions = React.useMemo(
+    () => (sessionStatus?.sessions || []).filter((item) => selectedSessionSet.has(item.id)),
+    [selectedSessionSet, sessionStatus?.sessions],
+  );
 
   const enabledSkillCount = skillsMcpState?.skills.filter((item) => item.enabled).length ?? 0;
   const enabledMcpCount = skillsMcpState?.mcpServers.filter((item) => item.enabled).length ?? 0;
@@ -1223,6 +1251,58 @@ function App() {
   React.useEffect(() => {
     setSelectedSessionIds((ids) => ids.filter((id) => (sessionStatus?.sessions || []).some((item) => item.id === id)));
   }, [sessionStatus?.sessions]);
+
+  React.useEffect(() => {
+    sessionDeleteBusyRef.current = sessionDeleteBusy;
+  }, [sessionDeleteBusy]);
+
+  React.useEffect(() => {
+    if (sessionDeleteConfirmOpen && selectedSessions.length === 0) {
+      setSessionDeleteConfirmOpen(false);
+    }
+  }, [selectedSessions.length, sessionDeleteConfirmOpen]);
+
+  React.useEffect(() => {
+    if (!sessionDeleteConfirmOpen) return;
+    const dialog = sessionDeleteDialogRef.current;
+    if (!dialog) return;
+    const restoreTarget = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusableElements = () => Array.from(dialog.querySelectorAll<HTMLElement>(
+      "button:not([disabled]), input:not([disabled]), [href], select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+    ));
+    const frame = window.requestAnimationFrame(() => {
+      (dialog.querySelector<HTMLElement>("[data-initial-focus]") || dialog).focus();
+    });
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (!sessionDeleteBusyRef.current) setSessionDeleteConfirmOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = focusableElements();
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", handleKeyDown);
+      if (restoreTarget?.isConnected) window.requestAnimationFrame(() => restoreTarget.focus());
+    };
+  }, [sessionDeleteConfirmOpen]);
 
   const call = React.useCallback(async <T,>(fn: () => Promise<T>, success?: (data: T) => void) => {
     setLoading(true);
@@ -1940,30 +2020,55 @@ function App() {
     setSelectedSessionIds((ids) => ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id]);
   };
 
-  const selectVisibleNeedsSyncSessions = () => {
-    const ids = filteredSessions.filter((item) => item.needsSync).map((item) => item.id);
-    setSelectedSessionIds(ids);
+  const setSessionGroupSelected = (sessions: SessionPreview[], checked: boolean) => {
+    const groupIds = new Set(sessions.map((item) => item.id));
+    setSelectedSessionIds((ids) => {
+      const next = new Set(ids);
+      if (checked) groupIds.forEach((id) => next.add(id));
+      else groupIds.forEach((id) => next.delete(id));
+      return Array.from(next);
+    });
   };
 
-  const syncSelectedSessions = async () => {
-    setActionBusy("syncSelectedSessions");
-    await call(
-      () => invoke<SessionSyncResult>("sync_selected_sessions_provider", {
+  const closeSessionDeleteConfirm = () => {
+    if (!sessionDeleteBusy) {
+      setSessionDeleteConfirmOpen(false);
+      setSessionDeleteSafetyConfirmed(false);
+    }
+  };
+
+  const deleteSelectedSessions = async () => {
+    if (!selectedSessionIds.length || sessionDeleteBusy || !sessionDeleteSafetyConfirmed) return;
+    setSessionDeleteBusy(true);
+    setToast("");
+    setError("");
+    try {
+      const result = await invoke<SessionDeleteResult>("delete_codex_sessions", {
         input: {
           configDir: configDir || null,
-          targetProvider: null,
           sessionIds: selectedSessionIds,
         },
-      }),
-      (result) => {
-        setSessionStatus(result.status);
-        setSelectedSessionIds([]);
+      });
+      setSessionStatus(result.status);
+      const remainingIds = new Set(result.status.sessions.map((item) => item.id));
+      setSelectedSessionIds((ids) => ids.filter((id) => remainingIds.has(id)));
+      setSessionDeleteConfirmOpen(false);
+      setSessionDeleteSafetyConfirmed(false);
+      const hasPartialFailure = result.failedSessions > 0 || Boolean(result.failureMessage);
+      if (hasPartialFailure) {
+        setError(result.failureMessage || (lang === "zh"
+          ? `${result.failedSessions} 个会话删除失败，请关闭其他 Codex 窗口或 CLI 后重试。`
+          : `${result.failedSessions} session deletion(s) failed. Close other Codex windows or CLIs and retry.`));
+      } else {
         setToast(lang === "zh"
-          ? `已修复选中的 ${result.updatedThreads} 条聊天记录`
-          : `Selected sessions repaired: ${result.updatedThreads} chat row(s)`);
-      },
-    );
-    setActionBusy("");
+          ? `已永久删除 ${result.deletedSessions} 条会话，并清理数据库、Rollout 与关联历史`
+          : `Permanently deleted ${result.deletedSessions} session(s) and cleaned database, rollout, and related history data`);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSessionDeleteBusy(false);
+    }
   };
 
   const closeStartupWizard = () => {
@@ -2039,7 +2144,7 @@ function App() {
         <div className="sidebar-footer" />
       </aside>
 
-      <section className="content">
+      <section className={cx("content", tab === "sessions" && "session-content")}>
         {tab === "dashboard" && (
           <header className="topbar glass">
             <div>
@@ -2160,6 +2265,92 @@ function App() {
                 </button>
                 <button className="secondary-btn" onClick={() => setSkillsMcpImportOpen(false)} disabled={actionBusy === "importExistingSkillsMcp"}>
                   {lang === "zh" ? "取消" : "Cancel"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {sessionDeleteConfirmOpen && selectedSessions.length > 0 && (
+          <div className="update-mask" onClick={closeSessionDeleteConfirm}>
+            <div
+              ref={sessionDeleteDialogRef}
+              className="update-dialog glass session-delete-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="session-delete-title"
+              aria-describedby="session-delete-description"
+              tabIndex={-1}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="update-head session-delete-head">
+                <div className="update-icon session-delete-icon"><Trash2 size={22} /></div>
+                <div>
+                  <p className="eyebrow">Codex Storage</p>
+                  <h3 id="session-delete-title">
+                    {lang === "zh" ? `永久删除 ${selectedSessions.length} 条会话` : `Permanently delete ${selectedSessions.length} session(s)`}
+                  </h3>
+                </div>
+              </div>
+              <div className="update-body session-delete-body">
+                <div className="session-delete-warning">
+                  <AlertCircle size={19} />
+                  <div>
+                    <strong>{lang === "zh" ? "此操作不可恢复" : "This cannot be undone"}</strong>
+                    <p id="session-delete-description">
+                      {lang === "zh"
+                        ? "所选会话将从当前 Codex 存储中硬删除，不会移入回收站，也不会创建新的备份；Codex-X 无法撤销或恢复。"
+                        : "The selected sessions will be hard-deleted from the current Codex storage. No recycle bin or new backup will be created, and Codex-X cannot undo or restore them."}
+                    </p>
+                    <p>
+                      {lang === "zh"
+                        ? "由这些会话派生的子会话也会一并删除。"
+                        : "Child sessions spawned from these sessions will also be deleted."}
+                    </p>
+                    <p>
+                      {lang === "zh"
+                        ? "删除前请关闭其他正在使用这些会话的 Codex 窗口或 CLI；活动会话仍可能继续写入并导致删除失败。"
+                        : "Before deleting, close other Codex windows or CLIs using these sessions. An active session may keep writing and cause deletion to fail."}
+                    </p>
+                  </div>
+                </div>
+                <div className="session-delete-list" aria-label={lang === "zh" ? "待删除会话" : "Sessions to delete"}>
+                  {selectedSessions.slice(0, 8).map((item) => (
+                    <div className="session-delete-item" key={item.id}>
+                      <strong title={item.title}>{item.title || (lang === "zh" ? "未命名会话" : "Untitled session")}</strong>
+                      <code>#{shortId(item.id)}</code>
+                      <span title={item.cwd || item.rolloutPath || undefined}>{compactPath(item.cwd || item.rolloutPath, 72)}</span>
+                    </div>
+                  ))}
+                  {selectedSessions.length > 8 && (
+                    <p className="session-delete-more">
+                      {lang === "zh" ? `另有 ${selectedSessions.length - 8} 条会话未在此处展开` : `${selectedSessions.length - 8} more session(s) not shown`}
+                    </p>
+                  )}
+                </div>
+                <label className="session-delete-process-check">
+                  <input
+                    type="checkbox"
+                    checked={sessionDeleteSafetyConfirmed}
+                    onChange={(event) => setSessionDeleteSafetyConfirmed(event.target.checked)}
+                    disabled={sessionDeleteBusy}
+                  />
+                  <span>
+                    {lang === "zh"
+                      ? "我已关闭其他正在使用这些会话的 Codex 窗口或 CLI"
+                      : "I closed other Codex windows or CLIs using these sessions"}
+                  </span>
+                </label>
+              </div>
+              <div className="update-actions session-delete-actions">
+                <button className="secondary-btn" onClick={closeSessionDeleteConfirm} disabled={sessionDeleteBusy} data-initial-focus>
+                  {lang === "zh" ? "取消" : "Cancel"}
+                </button>
+                <button className="danger-btn session-delete-confirm-btn" onClick={deleteSelectedSessions} disabled={sessionDeleteBusy || !sessionDeleteSafetyConfirmed}>
+                  {sessionDeleteBusy ? <Loader2 size={17} className="spin" /> : <Trash2 size={17} />}
+                  {sessionDeleteBusy
+                    ? (lang === "zh" ? "正在永久删除..." : "Deleting permanently...")
+                    : (lang === "zh" ? `确认永久删除 ${selectedSessions.length} 条` : `Delete ${selectedSessions.length} permanently`)}
                 </button>
               </div>
             </div>
@@ -2480,11 +2671,9 @@ function App() {
                 </div>
 
                 <div className={cx("session-compact-summary", sessionStatus?.needsSync ? "needs-sync" : "synced")}>
-                  <span>{sessionStatus?.needsSync ? <AlertCircle size={16} /> : <CheckCircle2 size={16} />} {sessionStatus?.needsSync ? (lang === "zh" ? "发现未同步" : "Unsynced") : (lang === "zh" ? "会话已同步" : "Synced")}</span>
-                  <span>{lang === "zh" ? "聊天总数" : "Total"} <strong>{sessionStatus?.sqliteThreads ?? "-"}</strong></span>
-                  <span>{lang === "zh" ? "已展示" : "Shown"} <strong>{filteredSessions.length}</strong></span>
-                  <span>{lang === "zh" ? "需修复" : "Need repair"} <strong>{sessionStatus ? unsyncedChatCount : "-"}</strong></span>
-                  <span>{lang === "zh" ? "状态" : "Status"} <strong>{sessionStatus?.needsSync ? (lang === "zh" ? "可修复" : "Repairable") : (lang === "zh" ? "正常" : "OK")}</strong></span>
+                  <span className="session-summary-status">{sessionStatus?.needsSync ? <AlertCircle size={15} /> : <CheckCircle2 size={15} />} {sessionStatus?.needsSync ? (lang === "zh" ? "发现未同步" : "Unsynced") : (lang === "zh" ? "会话已同步" : "Synced")}</span>
+                  <span>{lang === "zh" ? `${sessionStatus?.sqliteThreads ?? 0} 条会话` : `${sessionStatus?.sqliteThreads ?? 0} sessions`}</span>
+                  {sessionStatus?.needsSync && <span className="session-summary-warning">{lang === "zh" ? `${unsyncedChatCount} 条需修复` : `${unsyncedChatCount} need repair`}</span>}
                 </div>
 
                 <div className="session-list-card">
@@ -2493,7 +2682,9 @@ function App() {
                       <p className="eyebrow">{lang === "zh" ? "本地会话" : "Local threads"}</p>
                       <h4>{lang === "zh" ? "会话列表" : "Sessions"}</h4>
                     </div>
-                    <span>{lang === "zh" ? `展示 ${filteredSessions.length} / ${sessionStatus?.sqliteThreads ?? 0} 条` : `${filteredSessions.length} / ${sessionStatus?.sqliteThreads ?? 0} shown`}</span>
+                    <span title={sessionPreviewTruncated ? (lang === "zh" ? `当前加载最近 ${sessionStatus?.sessions.length ?? 0} 条` : `Latest ${sessionStatus?.sessions.length ?? 0} loaded`) : undefined}>
+                      {lang === "zh" ? `展示 ${filteredSessions.length} / ${sessionStatus?.sqliteThreads ?? 0} 条` : `${filteredSessions.length} / ${sessionStatus?.sqliteThreads ?? 0} shown`}
+                    </span>
                   </div>
 
                   <div className="session-toolbar">
@@ -2501,7 +2692,11 @@ function App() {
                       <Search size={16} />
                       <input
                         value={sessionQuery}
-                        onChange={(e) => setSessionQuery(e.target.value)}
+                        onChange={(e) => {
+                          setSessionQuery(e.target.value);
+                          setSelectedSessionIds([]);
+                          setSessionDeleteConfirmOpen(false);
+                        }}
                         placeholder={lang === "zh" ? "搜索标题 / cwd / Provider / ID" : "Search title / cwd / Provider / ID"}
                       />
                     </label>
@@ -2509,67 +2704,91 @@ function App() {
                       <input type="checkbox" checked={sessionGroupByCwd} onChange={(e) => setSessionGroupByCwd(e.target.checked)} />
                       <span>{lang === "zh" ? "按项目路径分组" : "Group by cwd"}</span>
                     </label>
-                    <span className="session-selected-hint">
-                      {lang === "zh"
-                        ? `已选 ${selectedSessionIds.length} 条 · 需修复 ${selectedNeedsSyncCount} 条`
-                        : `${selectedSessionIds.length} selected · ${selectedNeedsSyncCount} repairable`}
-                    </span>
-                    <button className="ghost-btn small" onClick={selectVisibleNeedsSyncSessions} disabled={!filteredSessions.some((item) => item.needsSync)}>
-                      {lang === "zh" ? "选择需同步" : "Select unsynced"}
-                    </button>
-                    <button className="secondary-btn small" onClick={() => setSelectedSessionIds([])} disabled={!selectedSessionIds.length}>
-                      {lang === "zh" ? "清空选择" : "Clear"}
-                    </button>
-                    <button className="primary-btn small lively-btn" onClick={syncSelectedSessions} disabled={loading || selectedNeedsSyncCount === 0}>
-                      {actionBusy === "syncSelectedSessions" ? <Loader2 size={15} className="spin" /> : <Zap size={15} />} {actionBusy === "syncSelectedSessions" ? (lang === "zh" ? "修复中..." : "Repairing...") : (lang === "zh" ? `修复选中 ${selectedNeedsSyncCount}` : `Repair ${selectedNeedsSyncCount}`)}
+                    <button
+                      ref={sessionDeleteTriggerRef}
+                      className={cx("small session-delete-trigger", selectedSessionIds.length > 0 ? "danger-btn active" : "secondary-btn")}
+                      onClick={() => {
+                        setSessionDeleteSafetyConfirmed(false);
+                        setSessionDeleteConfirmOpen(true);
+                      }}
+                      disabled={loading || sessionDeleteBusy || selectedSessionIds.length === 0}
+                      title={selectedSessionIds.length > 0 ? undefined : (lang === "zh" ? "先勾选要删除的会话" : "Select sessions to delete")}
+                    >
+                      <Trash2 size={16} />
+                      {selectedSessionIds.length > 0
+                        ? (lang === "zh" ? `永久删除 ${selectedSessionIds.length} 条` : `Delete ${selectedSessionIds.length} permanently`)
+                        : (lang === "zh" ? "删除选中" : "Delete selected")}
                     </button>
                   </div>
 
                   {filteredSessions.length ? (
                     <div className="session-list enhanced-session-list">
-                      {groupedSessions.map(([group, items]) => (
-                        <div className="session-group" key={group}>
-                          <div className="session-group-title">
-                            <span title={group}>{compactPath(group, 88)}</span>
-                            <em>{items.length}</em>
-                          </div>
-                          {items.map((item) => {
-                            const providerOk = !item.needsSync;
-                            return (
-                              <article
+                      <div className="session-column-head">
+                        <span aria-hidden="true" />
+                        <span>{lang === "zh" ? "会话" : "Session"}</span>
+                        <span>{lang === "zh" ? "更新时间" : "Updated"}</span>
+                        <span>Provider</span>
+                        <span>{lang === "zh" ? "模型" : "Model"}</span>
+                        <span>ID</span>
+                      </div>
+                      {groupedSessions.map(([group, items]) => {
+                        const showGroupHeader = sessionGroupByCwd;
+                        const projectSessions = allSessionsByCwd.get(group) || items;
+                        const selectedProjectCount = projectSessions.filter((item) => selectedSessionSet.has(item.id)).length;
+                        const projectSelected = selectedProjectCount === projectSessions.length;
+                        const projectPartiallySelected = selectedProjectCount > 0 && !projectSelected;
+                        const groupCountLabel = items.length === projectSessions.length
+                          ? (lang === "zh" ? `${sessionPreviewTruncated ? "已加载 " : ""}${projectSessions.length} 条` : `${projectSessions.length}${sessionPreviewTruncated ? " loaded" : ""}`)
+                          : (lang === "zh" ? `显示 ${items.length} / 共 ${projectSessions.length} 条` : `${items.length} / ${projectSessions.length} shown`);
+                        return (
+                          <div className="session-group" key={group}>
+                            {showGroupHeader && (
+                              <label className={cx("session-group-title", projectSelected && "selected", projectPartiallySelected && "partial")}>
+                                <input
+                                  className="session-checkbox"
+                                  type="checkbox"
+                                  ref={(input) => {
+                                    if (input) input.indeterminate = projectPartiallySelected;
+                                  }}
+                                  checked={projectSelected}
+                                  onChange={(event) => setSessionGroupSelected(projectSessions, event.target.checked)}
+                                  aria-label={lang === "zh" ? `选择当前列表中项目 ${group} 的 ${projectSessions.length} 条会话` : `Select ${projectSessions.length} loaded sessions in project ${group}`}
+                                />
+                                <span title={group}>{compactPath(group, 96)}</span>
+                                <em>{groupCountLabel}</em>
+                              </label>
+                            )}
+                            {items.map((item) => (
+                              <label
                                 className={cx("session-row", item.needsSync && "needs-sync", selectedSessionSet.has(item.id) && "selected")}
                                 key={item.id}
-                                onClick={() => toggleSessionSelected(item.id)}
                               >
-                                <label className="session-select-box" title={lang === "zh" ? "选择这个会话" : "Select this session"} onClick={(e) => e.stopPropagation()}>
+                                <span className="session-select-box" title={lang === "zh" ? "选择这个会话" : "Select this session"}>
                                   <input
+                                    className="session-checkbox"
                                     type="checkbox"
                                     checked={selectedSessionSet.has(item.id)}
                                     onChange={() => toggleSessionSelected(item.id)}
+                                    aria-label={`${lang === "zh" ? "选择会话" : "Select session"}: ${item.title} (#${shortId(item.id)})`}
                                   />
-                                </label>
-                                <div className="session-row-main">
-                                  <div className="session-thread-icon"><History size={18} /></div>
-                                  <div className="session-row-text">
-                                    <div className="session-row-title">
-                                      <strong>{item.title}</strong>
-                                      {item.archived && <span className="mini-tag">{lang === "zh" ? "已归档" : "Archived"}</span>}
-                                      <span className={cx("mini-tag", providerOk ? "ok" : "warn")}>{providerOk ? (lang === "zh" ? "Provider 一致" : "Provider OK") : (lang === "zh" ? "需同步" : "Needs sync")}</span>
-                                    </div>
-                                    <p title={item.cwd || item.rolloutPath || undefined}>{compactPath(item.cwd || item.rolloutPath)}</p>
+                                </span>
+                                <div className="session-row-text">
+                                  <div className="session-row-title">
+                                    <strong>{item.title}</strong>
+                                    {item.archived && <span className="session-state-text">{lang === "zh" ? "已归档" : "Archived"}</span>}
+                                    {item.needsSync && <span className="session-state-text warn">{lang === "zh" ? "需同步" : "Needs sync"}</span>}
                                   </div>
+                                  {!showGroupHeader && <p title={item.cwd || item.rolloutPath || undefined}>{compactPath(item.cwd || item.rolloutPath, 72)}</p>}
                                 </div>
-                                <div className="session-row-meta">
-                                  <span title={item.updatedAtMs ? new Date(item.updatedAtMs).toLocaleString() : undefined}>{formatSessionTime(item.updatedAtMs)}</span>
-                                  <code title={item.modelProvider || undefined}>{item.modelProvider || "unknown"}</code>
-                                  <em title={item.model || undefined}>{item.model || "model -"}</em>
-                                  <small>#{shortId(item.id)}</small>
-                                </div>
-                              </article>
-                            );
-                          })}
-                        </div>
-                      ))}
+                                <span className="session-meta-time" title={item.updatedAtMs ? new Date(item.updatedAtMs).toLocaleString() : undefined}>{formatSessionTime(item.updatedAtMs)}</span>
+                                <code className="session-meta-provider" title={item.modelProvider || undefined}>{item.modelProvider || "unknown"}</code>
+                                <span className="session-meta-model" title={item.model || undefined}>{item.model || "-"}</span>
+                                <small className="session-meta-id">#{shortId(item.id)}</small>
+                              </label>
+                            ))}
+                          </div>
+                        );
+                      })}
                     </div>
                   ) : (
                     <div className="session-empty">

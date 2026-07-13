@@ -44,7 +44,7 @@ fn version_from_output(output: Output) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn run_program(program: &Path, args: &[&str]) -> Option<Output> {
+pub fn program_command(program: &Path, args: &[&str]) -> Command {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -54,7 +54,7 @@ fn run_program(program: &Path, args: &[&str]) -> Option<Output> {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
     let mut command = if is_script {
         let mut shell = Command::new("cmd.exe");
-        let command_line = format!("\"{}\" {}", program.display(), args.join(" "));
+        let command_line = format!("\"\"{}\" {}\"", program.display(), args.join(" "));
         shell.args(["/D", "/S", "/C"]).arg(command_line);
         shell
     } else {
@@ -62,12 +62,19 @@ fn run_program(program: &Path, args: &[&str]) -> Option<Output> {
         direct.args(args);
         direct
     };
-    command.creation_flags(CREATE_NO_WINDOW).output().ok()
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 #[cfg(not(target_os = "windows"))]
+pub fn program_command(program: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    command.args(args);
+    command
+}
+
 fn run_program(program: &Path, args: &[&str]) -> Option<Output> {
-    Command::new(program).args(args).output().ok()
+    program_command(program, args).output().ok()
 }
 
 fn command_version(program: &Path) -> Option<String> {
@@ -296,23 +303,26 @@ fn macos_app_version() -> Option<String> {
     None
 }
 
-pub fn detect_codex_version() -> Option<String> {
-    for command in ["codex", "codex.exe", "codex.cmd"] {
-        if let Some(version) = command_version(Path::new(command)) {
-            return Some(version);
-        }
-    }
-
+pub fn codex_executable_candidates() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_default();
-    let mut candidates = windows_where_candidates();
+    let mut candidates = ["codex", "codex.exe", "codex.cmd"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    candidates.extend(windows_where_candidates());
     candidates.extend(platform_candidates(&home));
     let mut seen = HashSet::new();
     let mut unique = Vec::new();
     for candidate in candidates {
         push_candidate(&mut unique, &mut seen, candidate);
     }
-    for candidate in unique {
-        if candidate.is_file() {
+    unique
+}
+
+pub fn detect_codex_version() -> Option<String> {
+    for candidate in codex_executable_candidates() {
+        let is_bare_command = candidate.components().count() == 1;
+        if is_bare_command || candidate.is_file() {
             if let Some(version) = command_version(&candidate) {
                 return Some(version);
             }
