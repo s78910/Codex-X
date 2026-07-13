@@ -107,6 +107,29 @@ test("refresh ingests an Actions snapshot and stores aggregated history", async 
   assert.equal("stargazers" in stored, false);
 });
 
+test("refresh reconciles an existing baseline without Stargazer details", async () => {
+  const env = testEnv(baseline("2026-01-02T00:00:00Z"));
+  const payload = {
+    repository: "yynxxxxx/Codex-X",
+    createdAt: "2026-01-01T00:00:00Z",
+    checkedAt: "2026-01-03T00:00:00Z",
+    currentStars: 11,
+  };
+  const response = await worker.fetch(new Request("https://example.test/v1/refresh", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.INGEST_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  }), env);
+  const stored = await env.STAR_HISTORY.get("repository:yynxxxxx/codex-x", "json");
+
+  assert.equal(response.status, 200);
+  assert.equal(stored.currentStars, 11);
+  assert.equal(stored.snapshots.at(-1).count, 11);
+});
+
 test("webhook events use unique keys and duplicate deliveries stay idempotent", async () => {
   const env = testEnv(baseline("2026-01-02T00:00:00Z"));
   const payload = JSON.stringify({
