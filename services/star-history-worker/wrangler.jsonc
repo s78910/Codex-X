@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "codex-star-history",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-13",
+  "workers_dev": true,
+  "kv_namespaces": [
+    {
+      "binding": "STAR_HISTORY",
+      "id": "f7be4a2c132941cebbb4732dbf9b213b"
+    }
+  ],
+  "vars": {
+    "ALLOWED_REPOSITORIES": "yynxxxxx/Codex-X,yynxxxxx/Codex-5.5-codex-instruct-5.5",
+    "REPOSITORY_ALIASES": "codex-x=yynxxxxx/Codex-X,codex-5-5=yynxxxxx/Codex-5.5-codex-instruct-5.5"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
