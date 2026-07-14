@@ -9,7 +9,7 @@ pub(crate) fn string_value(doc: &DocumentMut, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(super) fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table> {
+pub(crate) fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table> {
     if !parent.contains_key(key) {
         parent[key] = Item::Table(Table::new());
     }
