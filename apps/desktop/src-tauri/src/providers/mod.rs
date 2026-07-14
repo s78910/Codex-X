@@ -1,9 +1,19 @@
+mod ccswitch;
 mod live;
 mod store;
 
 use crate::error::Result;
 use rusqlite::Connection;
 
+#[cfg(test)]
+pub(crate) use ccswitch::{
+    build_ccswitch_codex_provider, codex_sections_from_config, is_official_ccswitch_row,
+    read_ccswitch_codex_rows, CcSwitchCodexRow,
+};
+pub(crate) use ccswitch::{
+    import_ccswitch_codex_providers_inner, read_ccswitch_official_auth_inner, ImportResult,
+    OfficialAuthCandidate,
+};
 #[cfg(test)]
 pub(crate) use live::{
     detected_live_custom_provider, save_provider_toml_config_with_pre_persist,

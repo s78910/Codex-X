@@ -1,3 +1,4 @@
+use super::ccswitch::codex_section_from_table;
 use super::{
     custom_provider_id, experimental_bearer_token_from_doc, reserved_codex_provider_id,
     save_detected_provider_inner, SavedProvider,
@@ -9,7 +10,7 @@ use crate::file_io::{
 };
 use crate::state::{build_state, ActionResult};
 use crate::toml_utils::ensure_table;
-use crate::{auth_path, codex_section_from_table, config_path, resolve_codex_dir, string_value};
+use crate::{auth_path, config_path, resolve_codex_dir, string_value};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs;

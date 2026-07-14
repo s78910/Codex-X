@@ -1,14 +1,12 @@
 use chrono::Local;
 #[cfg(test)]
 use rusqlite::params;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::Connection;
 use serde::Serialize;
 #[cfg(test)]
-use serde_json::json;
-use serde_json::Value;
-use std::collections::HashMap;
+use serde_json::{json, Value};
 #[cfg(test)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,7 +29,6 @@ mod state;
 mod toml_utils;
 
 use backups::{action_backup_root, backups, create_backup, BackupEntry, BackupMeta};
-use ccswitch::{ccswitch_db_candidates, default_ccswitch_db_path};
 use constants::*;
 use error::{CodexxError, Result};
 #[cfg(test)]
@@ -56,17 +53,19 @@ use prompts::{
 };
 #[cfg(test)]
 use providers::{
-    canonical_provider_base_url, detected_live_custom_provider,
-    merge_duplicate_provider_identities, provider_by_id_on_connection, provider_identity,
-    save_manual_provider_on_connection, save_provider_toml_config_with_pre_persist,
-    switch_official_provider_with_pre_persist, switch_provider_with_pre_persist,
+    build_ccswitch_codex_provider, canonical_provider_base_url, codex_sections_from_config,
+    detected_live_custom_provider, is_official_ccswitch_row, list_saved_providers_on_connection,
+    merge_duplicate_provider_identities, normalize_saved_provider, provider_by_id_on_connection,
+    provider_identity, read_ccswitch_codex_rows, save_manual_provider_on_connection,
+    save_provider_toml_config_with_pre_persist, switch_official_provider_with_pre_persist,
+    switch_provider_with_pre_persist, upsert_provider_on_connection, CcSwitchCodexRow,
+    ProviderUpsertKind, ProviderUpsertMode,
 };
 use providers::{
-    custom_provider_id, delete_provider_inner, experimental_bearer_token_from_doc,
-    list_saved_providers_inner, list_saved_providers_on_connection, normalize_saved_provider,
-    save_official_config_inner, save_provider_inner, save_provider_toml_config_inner,
-    switch_official_provider_inner, switch_provider_inner, upsert_provider_on_connection,
-    OfficialConfigInput, ProviderInput, ProviderTomlInput, ProviderUpsertKind, ProviderUpsertMode,
+    delete_provider_inner, import_ccswitch_codex_providers_inner, list_saved_providers_inner,
+    read_ccswitch_official_auth_inner, save_official_config_inner, save_provider_inner,
+    save_provider_toml_config_inner, switch_official_provider_inner, switch_provider_inner,
+    ImportResult, OfficialAuthCandidate, OfficialConfigInput, ProviderInput, ProviderTomlInput,
     SavedProvider,
 };
 #[cfg(test)]
@@ -91,11 +90,10 @@ use skills_mcp::{
     normalize_legacy_zip_skill_dirs, read_skill_metadata, sort_managed_mcp_servers,
     sort_managed_skills, ManagedMcpServer, ManagedSkill,
 };
-use sqlite_utils::table_column_set;
 #[cfg(test)]
 use state::active_saved_provider_id_from_config;
 use state::{auth_has_material, build_state, ActionResult, CodexState};
-use toml_edit::{value, DocumentMut, Table};
+use toml_edit::{value, DocumentMut};
 pub(crate) use toml_utils::string_value;
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,26 +124,6 @@ impl PromptInjectionMode {
             other => Err(CodexxError::Config(format!("未知提示词注入模式: {other}"))),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImportResult {
-    imported: usize,
-    added: usize,
-    updated: usize,
-    merged: usize,
-    skipped: usize,
-    warnings: Vec<String>,
-    providers: Vec<SavedProvider>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OfficialAuthCandidate {
-    auth_json: String,
-    model: Option<String>,
-    source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,336 +197,6 @@ pub(crate) fn sanitize_id(input: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
-struct CcSwitchCodexRow {
-    id: String,
-    name: String,
-    settings_config: String,
-    category: Option<String>,
-}
-
-fn is_official_ccswitch_row(row: &CcSwitchCodexRow) -> bool {
-    row.id.trim().eq_ignore_ascii_case("codex-official")
-        || row
-            .category
-            .as_deref()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("official"))
-}
-
-fn read_ccswitch_codex_rows(conn: &Connection) -> Result<Vec<CcSwitchCodexRow>> {
-    let provider_columns = table_column_set(conn, "providers")?;
-    let category_column = if provider_columns.contains("category") {
-        "category"
-    } else {
-        "NULL"
-    };
-    let provider_query = format!(
-        "SELECT id, name, settings_config, {category_column} FROM providers
-         WHERE app_type = 'codex' ORDER BY sort_index ASC, created_at ASC"
-    );
-    let mut stmt = conn
-        .prepare(&provider_query)
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(CcSwitchCodexRow {
-                id: row.get::<_, String>(0)?,
-                name: row.get::<_, String>(1)?,
-                settings_config: row.get::<_, String>(2)?,
-                category: row.get::<_, Option<String>>(3)?,
-            })
-        })
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row.map_err(|e| CodexxError::Database(e.to_string()))?);
-    }
-    Ok(result)
-}
-
-#[derive(Debug, Clone)]
-struct CcSwitchCodexSection {
-    id: String,
-    name: Option<String>,
-    base_url: String,
-    model: Option<String>,
-    wire_api: String,
-    requires_openai_auth: bool,
-    experimental_bearer_token: Option<String>,
-}
-
-fn table_string(table: &Table, key: &str) -> Option<String> {
-    table
-        .get(key)
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-}
-
-fn ccswitch_auth_api_key(settings: &Value) -> Option<String> {
-    settings
-        .get("auth")
-        .and_then(|v| v.get("OPENAI_API_KEY"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-}
-
-fn codex_section_from_table(
-    id: &str,
-    table: &Table,
-    model: Option<String>,
-) -> Option<CcSwitchCodexSection> {
-    let base_url = table_string(table, "base_url")?
-        .trim_end_matches('/')
-        .to_string();
-    if base_url.is_empty() {
-        return None;
-    }
-    Some(CcSwitchCodexSection {
-        id: id.to_string(),
-        name: table_string(table, "name"),
-        base_url,
-        model,
-        wire_api: table_string(table, "wire_api").unwrap_or_else(|| "responses".to_string()),
-        requires_openai_auth: table
-            .get("requires_openai_auth")
-            .and_then(|item| item.as_bool())
-            .unwrap_or(false),
-        experimental_bearer_token: table_string(table, "experimental_bearer_token"),
-    })
-}
-
-fn codex_sections_from_config(config_text: &str) -> Vec<CcSwitchCodexSection> {
-    let Ok(doc) = config_text.parse::<DocumentMut>() else {
-        return Vec::new();
-    };
-    let model = string_value(&doc, "model");
-    let Some(providers) = doc.get("model_providers").and_then(|item| item.as_table()) else {
-        return Vec::new();
-    };
-    providers
-        .iter()
-        .filter_map(|(id, item)| {
-            item.as_table()
-                .and_then(|table| codex_section_from_table(id, table, model.clone()))
-        })
-        .collect()
-}
-
-fn select_ccswitch_section_for_row(
-    row: &CcSwitchCodexRow,
-    settings: &Value,
-    global_sections: &HashMap<String, CcSwitchCodexSection>,
-) -> Option<CcSwitchCodexSection> {
-    let provider_id = custom_provider_id(&row.id);
-    if let Some(section) = global_sections.get(&provider_id) {
-        return Some(section.clone());
-    }
-    if let Some(section) = global_sections.get(row.id.trim()) {
-        return Some(section.clone());
-    }
-
-    let config_text = settings.get("config").and_then(Value::as_str).unwrap_or("");
-    let doc = config_text.parse::<DocumentMut>().ok()?;
-    let model = string_value(&doc, "model");
-    let active_provider = string_value(&doc, "model_provider");
-    let providers = doc.get("model_providers").and_then(|item| item.as_table());
-
-    if let Some(providers) = providers {
-        for exact_id in [provider_id.as_str(), row.id.trim()] {
-            if let Some(section) = providers
-                .get(exact_id)
-                .and_then(|item| item.as_table())
-                .and_then(|table| codex_section_from_table(exact_id, table, model.clone()))
-            {
-                return Some(section);
-            }
-        }
-
-        if active_provider.as_deref() == Some(row.id.trim())
-            || active_provider.as_deref() == Some(provider_id.as_str())
-        {
-            if let Some(active) = active_provider.as_deref() {
-                if let Some(section) = providers
-                    .get(active)
-                    .and_then(|item| item.as_table())
-                    .and_then(|table| codex_section_from_table(active, table, model.clone()))
-                {
-                    return Some(section);
-                }
-            }
-        }
-
-        // Legacy cc-switch/custom templates often store every third-party provider
-        // under `[model_providers.custom]`. Only use it when the row's own config
-        // explicitly activates custom or contains no other provider identity.
-        if active_provider
-            .as_deref()
-            .is_none_or(|active| active == "custom")
-        {
-            if let Some(section) = providers
-                .get("custom")
-                .and_then(|item| item.as_table())
-                .and_then(|table| codex_section_from_table("custom", table, model.clone()))
-            {
-                return Some(section);
-            }
-        }
-    }
-
-    doc.get("base_url")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|base_url| CcSwitchCodexSection {
-            id: provider_id,
-            name: None,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            model,
-            wire_api: "responses".to_string(),
-            requires_openai_auth: false,
-            experimental_bearer_token: experimental_bearer_token_from_doc(
-                &doc,
-                active_provider.as_deref(),
-            ),
-        })
-}
-
-fn build_ccswitch_codex_provider(
-    row: &CcSwitchCodexRow,
-    global_sections: &HashMap<String, CcSwitchCodexSection>,
-) -> Option<SavedProvider> {
-    let settings: Value = serde_json::from_str(&row.settings_config).ok()?;
-    let section = select_ccswitch_section_for_row(row, &settings, global_sections)?;
-    let api_key = ccswitch_auth_api_key(&settings).or(section.experimental_bearer_token.clone());
-    Some(SavedProvider {
-        id: custom_provider_id(&row.id),
-        provider_name: if row.name.trim().is_empty() {
-            section.name.unwrap_or_else(|| row.id.clone())
-        } else {
-            row.name.trim().to_string()
-        },
-        base_url: section.base_url,
-        model: section.model.unwrap_or_else(|| "gpt-5.5".to_string()),
-        api_key,
-        toml_config: None,
-        wire_api: section.wire_api,
-        requires_openai_auth: section.requires_openai_auth,
-    })
-}
-
-fn import_ccswitch_codex_providers_inner(path: Option<String>) -> Result<ImportResult> {
-    let db = path
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or(default_ccswitch_db_path()?);
-
-    if !db.exists() {
-        let candidates = ccswitch_db_candidates()?
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n- ");
-        return Err(CodexxError::Config(format!(
-            "cc-switch 数据库不存在: {}\n已检查候选路径:\n- {}",
-            db.display(),
-            candidates
-        )));
-    }
-
-    let conn = Connection::open_with_flags(
-        &db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| {
-        CodexxError::Database(format!("打开 cc-switch 数据库失败 {}: {e}", db.display()))
-    })?;
-
-    let rows_vec = read_ccswitch_codex_rows(&conn)?;
-
-    let mut global_sections: HashMap<String, CcSwitchCodexSection> = HashMap::new();
-    for row in &rows_vec {
-        if is_official_ccswitch_row(row) {
-            continue;
-        }
-        let Ok(settings) = serde_json::from_str::<Value>(&row.settings_config) else {
-            continue;
-        };
-        let Some(config_text) = settings.get("config").and_then(Value::as_str) else {
-            continue;
-        };
-        for section in codex_sections_from_config(config_text) {
-            if !global_sections.contains_key(&section.id) {
-                global_sections.insert(section.id.clone(), section);
-            }
-        }
-    }
-
-    let mut imported = 0usize;
-    let mut added = 0usize;
-    let mut updated = 0usize;
-    let mut merged = 0usize;
-    let mut skipped = 0usize;
-    let mut warnings = Vec::new();
-    let mut local_conn = open_db()?;
-    let transaction = local_conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-
-    for row in rows_vec {
-        if is_official_ccswitch_row(&row) {
-            skipped += 1;
-            warnings.push(format!(
-                "跳过 {} ({})：官方认证不作为第三方供应商导入",
-                row.name, row.id
-            ));
-            continue;
-        }
-        match build_ccswitch_codex_provider(&row, &global_sections) {
-            Some(provider) => {
-                let provider = normalize_saved_provider(provider)?;
-                let result = upsert_provider_on_connection(
-                    &transaction,
-                    provider,
-                    ProviderUpsertMode::Imported,
-                )?;
-                match result.kind {
-                    ProviderUpsertKind::Added => added += 1,
-                    ProviderUpsertKind::Updated => updated += 1,
-                    ProviderUpsertKind::Merged => merged += 1,
-                }
-                imported += 1;
-            }
-            None => {
-                skipped += 1;
-                warnings.push(format!(
-                    "跳过 {} ({})：未找到可用 config/base_url，可能是官方登录或空模板",
-                    row.name, row.id
-                ));
-            }
-        }
-    }
-    transaction
-        .commit()
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-    let providers = list_saved_providers_on_connection(&local_conn)?;
-
-    Ok(ImportResult {
-        imported,
-        added,
-        updated,
-        merged,
-        skipped,
-        warnings,
-        providers,
-    })
-}
-
 fn default_codex_dir() -> Result<PathBuf> {
     if let Ok(value) = std::env::var("CODEX_HOME") {
         let trimmed = value.trim();
@@ -575,84 +223,6 @@ pub(crate) fn config_path(codex_dir: &Path) -> PathBuf {
 
 pub(crate) fn auth_path(codex_dir: &Path) -> PathBuf {
     codex_dir.join("auth.json")
-}
-
-fn read_ccswitch_official_auth_inner(
-    path: Option<String>,
-) -> Result<Option<OfficialAuthCandidate>> {
-    let db = path
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or(default_ccswitch_db_path()?);
-
-    if !db.exists() {
-        return Ok(None);
-    }
-
-    let conn = Connection::open_with_flags(
-        &db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| {
-        CodexxError::Database(format!("打开 cc-switch 数据库失败 {}: {e}", db.display()))
-    })?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, settings_config FROM providers
-             WHERE app_type = 'codex' AND (id = 'codex-official' OR category = 'official')
-             ORDER BY CASE WHEN id = 'codex-official' THEN 0 ELSE 1 END
-             LIMIT 1",
-        )
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-
-    let Some(row) = rows
-        .next()
-        .map_err(|e| CodexxError::Database(e.to_string()))?
-    else {
-        return Ok(None);
-    };
-
-    let id: String = row
-        .get(0)
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-    let name: String = row
-        .get(1)
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-    let settings_config: String = row
-        .get(2)
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
-    let settings: Value = serde_json::from_str(&settings_config).map_err(|e| {
-        CodexxError::Database(format!("cc-switch official settings JSON 解析失败: {e}"))
-    })?;
-
-    let auth = settings
-        .get("auth")
-        .cloned()
-        .filter(|value| value.is_object())
-        .ok_or_else(|| {
-            CodexxError::Database("cc-switch official provider 缺少 auth object".to_string())
-        })?;
-
-    let model = settings
-        .get("config")
-        .and_then(Value::as_str)
-        .and_then(|text| text.parse::<DocumentMut>().ok())
-        .and_then(|doc| string_value(&doc, "model"));
-
-    let auth_json = serde_json::to_string_pretty(&auth)
-        .map_err(|e| CodexxError::Database(format!("官方 auth JSON 格式化失败: {e}")))?;
-
-    Ok(Some(OfficialAuthCandidate {
-        auth_json,
-        model,
-        source: format!("cc-switch:{name}:{id}"),
-    }))
 }
 
 fn diagnostic_item(
