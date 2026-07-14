@@ -200,6 +200,7 @@ type SessionPreview = {
   updatedAtMs?: number | null;
   archived: boolean;
   hasUserEvent: boolean;
+  isSubagent: boolean;
   needsSync: boolean;
 };
 
@@ -284,7 +285,6 @@ type StartupDiagnostics = {
 
 const LANG_KEY = "codexx.lang";
 const STARTUP_WIZARD_SEEN_KEY = "codexx.startupWizardSeen";
-const AUTO_SESSION_SYNC_KEY = "codexx.autoSessionSync";
 const ACTIVE_PROVIDER_KEY = "codexx.activeProviderId";
 const PROMPT_INJECTION_MODE_KEY = "codexx.promptInjectionMode";
 const FALLBACK_GITHUB_REPO = "yynxxxxx/Codex-X";
@@ -1021,12 +1021,11 @@ function App() {
   const [sessionQuery, setSessionQuery] = React.useState("");
   const deferredSessionQuery = React.useDeferredValue(sessionQuery);
   const [sessionGroupByCwd, setSessionGroupByCwd] = React.useState(false);
+  const [showInternalSessions, setShowInternalSessions] = React.useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = React.useState<string[]>([]);
   const [sessionDeleteConfirmOpen, setSessionDeleteConfirmOpen] = React.useState(false);
   const [sessionDeleteBusy, setSessionDeleteBusy] = React.useState(false);
   const [sessionDeleteSafetyConfirmed, setSessionDeleteSafetyConfirmed] = React.useState(false);
-  const [autoSessionSync, setAutoSessionSync] = React.useState(() => localStorage.getItem(AUTO_SESSION_SYNC_KEY) === "1");
-  const [autoSessionSyncBusy, setAutoSessionSyncBusy] = React.useState(false);
   const [state, setState] = React.useState<CodexState | null>(null);
   const [configDir, setConfigDir] = React.useState("");
   const [loading, setLoading] = React.useState(false);
@@ -1047,7 +1046,6 @@ function App() {
   const [officialForm, setOfficialForm] = React.useState({ model: "gpt-5.5", authJson: "" });
   const [promptModeHelpOpen, setPromptModeHelpOpen] = React.useState(false);
   const autoUpdateCheckedRef = React.useRef(false);
-  const autoSessionSyncRanRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
   const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
   const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
@@ -1285,24 +1283,28 @@ function App() {
     return rows;
   }, [detectedRows, inferredActiveProviderId, localRows, state?.model, state?.modelProvider]);
 
+  const visibleSessions = React.useMemo(
+    () => (sessionStatus?.sessions || []).filter((item) => showInternalSessions || !item.isSubagent),
+    [sessionStatus?.sessions, showInternalSessions],
+  );
+
   const filteredSessions = React.useMemo(() => {
     const query = deferredSessionQuery.trim().toLowerCase();
-    const list = sessionStatus?.sessions || [];
-    if (!query) return list;
-    return list.filter((item) => [item.title, item.cwd, item.rolloutPath, item.modelProvider, item.model, item.id]
+    if (!query) return visibleSessions;
+    return visibleSessions.filter((item) => [item.title, item.cwd, item.rolloutPath, item.modelProvider, item.model, item.id]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(query)));
-  }, [deferredSessionQuery, sessionStatus?.sessions]);
+  }, [deferredSessionQuery, visibleSessions]);
 
   const allSessionsByCwd = React.useMemo(() => {
     const groups = new Map<string, SessionPreview[]>();
-    for (const item of sessionStatus?.sessions || []) {
+    for (const item of visibleSessions) {
       const key = item.cwd || (lang === "zh" ? "未记录工作目录" : "No workspace recorded");
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key)!.push(item);
     }
     return groups;
-  }, [lang, sessionStatus?.sessions]);
+  }, [lang, visibleSessions]);
 
   const groupedSessions = React.useMemo(() => {
     const groups = new Map<string, SessionPreview[]>();
@@ -1318,8 +1320,23 @@ function App() {
     return Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length);
   }, [filteredSessions, lang, sessionGroupByCwd]);
 
-  const unsyncedChatCount = Math.max(sessionStatus?.mismatchedThreads ?? 0, sessionStatus?.mismatchedSessionMeta ?? 0);
-  const sessionPreviewTruncated = (sessionStatus?.topLevelThreads ?? 0) > (sessionStatus?.sessions.length ?? 0);
+  const sessionRolloutMismatchCount = sessionStatus?.mismatchedRollouts ?? 0;
+  const sessionIndexMismatchCount = sessionStatus?.mismatchedThreads ?? 0;
+  const sessionHasMismatches = Boolean(sessionStatus?.needsSync);
+  const sessionTargetProvider = sessionStatus?.targetProvider || state?.modelProvider || "openai";
+  const sessionTargetLabel = canonicalSavedProviders.find((item) => item.id === effectiveActiveProviderId)?.providerName
+    || currentProvider?.name
+    || sessionTargetProvider;
+  const previewSessionSyncCount = new Set(
+    (sessionStatus?.sessions || []).filter((item) => item.needsSync).map((item) => item.id),
+  ).size;
+  const sessionSyncCount = sessionHasMismatches
+    ? Math.max(1, previewSessionSyncCount, sessionRolloutMismatchCount, sessionIndexMismatchCount)
+    : 0;
+  const sessionVisibleTotal = showInternalSessions
+    ? (sessionStatus?.topLevelThreads ?? 0) + (sessionStatus?.subagentThreads ?? 0)
+    : (sessionStatus?.topLevelThreads ?? 0);
+  const sessionPreviewTruncated = sessionVisibleTotal > visibleSessions.length;
   const selectedSessionSet = React.useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
   const selectedSessions = React.useMemo(
     () => (sessionStatus?.sessions || []).filter((item) => selectedSessionSet.has(item.id)),
@@ -1438,10 +1455,6 @@ function App() {
   }, []);
 
   React.useEffect(() => {
-    localStorage.setItem(AUTO_SESSION_SYNC_KEY, autoSessionSync ? "1" : "0");
-  }, [autoSessionSync]);
-
-  React.useEffect(() => {
     if (!state) return;
     if (liveProviderId !== "custom") {
       if (activeProviderId) {
@@ -1461,27 +1474,6 @@ function App() {
       setActiveProviderId("");
     }
   }, [activeProviderId, inferredActiveProviderId, liveProviderId, savedProviders, state]);
-
-  React.useEffect(() => {
-    if (!autoSessionSync || autoSessionSyncRanRef.current || !state?.codexDir) return;
-    autoSessionSyncRanRef.current = true;
-    const resolvedConfigDir = configDir || state.codexDir || null;
-    setAutoSessionSyncBusy(true);
-    invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null })
-      .then((status) => {
-        if (!status.needsSync) {
-          setSessionStatus(status);
-          return null;
-        }
-        return invoke<SessionSyncResult>("sync_sessions_provider", { configDir: resolvedConfigDir, targetProvider: null })
-          .then((result) => {
-            setSessionStatus(result.status);
-            setToast(lang === "zh" ? `已自动修复 ${result.updatedThreads} 条会话` : `Auto repaired ${result.updatedThreads} session(s)`);
-          });
-      })
-      .catch(() => undefined)
-      .finally(() => setAutoSessionSyncBusy(false));
-  }, [autoSessionSync, configDir, lang, state?.codexDir]);
 
   const handleActionResult = (result: ActionResult) => {
     setState(result.state);
@@ -2077,24 +2069,31 @@ function App() {
       () => invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || null, targetProvider: null }),
       (status) => {
         setSessionStatus(status);
-        setToast(status.needsSync
-          ? (lang === "zh" ? `发现 ${Math.max(status.mismatchedThreads, status.mismatchedSessionMeta)} 个聊天需要修复` : `${Math.max(status.mismatchedThreads, status.mismatchedSessionMeta)} chat(s) need repair`)
-          : (lang === "zh" ? "会话已同步" : "Sessions are in sync"));
+        const hasMismatches = Boolean(status.needsSync);
+        const previewCount = new Set(status.sessions.filter((item) => item.needsSync).map((item) => item.id)).size;
+        const syncCount = hasMismatches
+          ? Math.max(1, previewCount, status.mismatchedRollouts, status.mismatchedThreads)
+          : 0;
+        setToast(hasMismatches
+          ? (lang === "zh" ? `有 ${syncCount} 条会话需要同步` : `${syncCount} session(s) need syncing`)
+          : (lang === "zh" ? "全部会话已同步" : "All sessions are synced"));
       },
     );
     setActionBusy("");
   };
 
   const syncSessions = async () => {
+    const pendingCount = sessionSyncCount;
     setActionBusy("syncSessions");
     await call(
       () => invoke<SessionSyncResult>("sync_sessions_provider", { configDir: configDir || null, targetProvider: null }),
       (result) => {
         setSessionStatus(result.status);
         setSelectedSessionIds([]);
+        const syncedCount = pendingCount || Math.max(result.updatedRollouts, result.updatedThreads);
         setToast(lang === "zh"
-          ? `已修复 ${result.updatedThreads} 条聊天记录`
-          : `Updated ${result.updatedThreads} chat row(s)`);
+          ? `已同步 ${syncedCount} 条会话，聊天内容未改动`
+          : `Synced ${syncedCount} session(s). Chat content was not changed.`);
       },
     );
     setActionBusy("");
@@ -2728,41 +2727,41 @@ function App() {
               <section className={cx("panel glass sessions-panel", tab !== "sessions" && "page-pane-hidden")}>
                 <div className="panel-head provider-title-row">
                   <div>
-                    <p className="eyebrow">Provider Sync</p>
+                    <p className="eyebrow">{lang === "zh" ? "会话同步" : "Session sync"}</p>
                     <h3>{lang === "zh" ? "会话管理" : "Session management"}</h3>
                     <p className="muted-desc">
                       {lang === "zh"
-                        ? "检查并修复 Codex 本地历史会话的 Provider 元数据，让切换供应商后旧 thread 仍能被原生 Codex 识别、打开和续聊。"
-                        : "Check and repair local Codex session provider metadata so old threads stay visible and resumable after provider switching."}
+                        ? "检查本地会话是否跟当前供应商一致，需要时一键同步。不会修改聊天内容。"
+                        : "Check whether local sessions match the current provider and sync them with one click when needed. Chat content is not changed."}
                     </p>
                   </div>
                   <div className="provider-title-actions session-title-actions">
-                    <label className="session-auto-toggle" title={lang === "zh" ? "启动 Codex-X 后在后台检查会话；发现未同步时自动修复" : "Check sessions on startup in the background and repair when needed"}>
-                      <input type="checkbox" checked={autoSessionSync} onChange={(e) => setAutoSessionSync(e.target.checked)} />
-                      <span>{lang === "zh" ? "启动自动修复" : "Auto repair on startup"}</span>
-                      {autoSessionSyncBusy && <Loader2 size={14} className="spin" />}
-                    </label>
                     <span className="session-provider-chip">
-                      {lang === "zh" ? "目标" : "Target"}: {sessionStatus?.targetProvider || state.modelProvider || "openai"}
+                      {lang === "zh" ? "同步到" : "Sync to"}: {sessionTargetLabel}
                     </span>
                     <button className="secondary-btn add-provider-btn lively-btn" onClick={checkSessions} disabled={loading}>
                       {actionBusy === "checkSessions" ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />} {actionBusy === "checkSessions" ? (lang === "zh" ? "检查中..." : "Checking...") : (lang === "zh" ? "检查会话" : "Check")}
                     </button>
-                    <button className="primary-btn add-provider-btn lively-btn" onClick={syncSessions} disabled={loading || !sessionStatus?.needsSync}>
-                      {actionBusy === "syncSessions" ? <Loader2 size={18} className="spin" /> : <Zap size={18} />} {actionBusy === "syncSessions" ? (lang === "zh" ? "修复中..." : "Repairing...") : (lang === "zh" ? "同步 / 修复" : "Sync / repair")}
+                    <button className="primary-btn add-provider-btn lively-btn" onClick={syncSessions} disabled={loading || !sessionHasMismatches}>
+                      {actionBusy === "syncSessions" ? <Loader2 size={18} className="spin" /> : <Zap size={18} />} {actionBusy === "syncSessions" ? (lang === "zh" ? "同步中..." : "Syncing...") : (lang === "zh" ? "同步会话" : "Sync sessions")}
                     </button>
                   </div>
                 </div>
 
-                <div className={cx("session-compact-summary", sessionStatus?.needsSync ? "needs-sync" : "synced")}>
-                  <span className="session-summary-status">{sessionStatus?.needsSync ? <AlertCircle size={15} /> : <CheckCircle2 size={15} />} {sessionStatus?.needsSync ? (lang === "zh" ? "发现未同步" : "Unsynced") : (lang === "zh" ? "会话已同步" : "Synced")}</span>
+                <div className={cx("session-compact-summary", sessionHasMismatches ? "needs-sync" : "synced")}>
+                  <span className="session-summary-status">
+                    {!sessionStatus
+                      ? <Info size={15} />
+                      : sessionHasMismatches
+                        ? <AlertCircle size={15} />
+                        : <CheckCircle2 size={15} />}
+                    {!sessionStatus
+                      ? (lang === "zh" ? "点击检查会话" : "Check sessions to get started")
+                      : sessionHasMismatches
+                        ? (lang === "zh" ? `有 ${sessionSyncCount} 条会话需要同步` : `${sessionSyncCount} session(s) need syncing`)
+                        : (lang === "zh" ? "全部会话已同步" : "All sessions are synced")}
+                  </span>
                   <span>{lang === "zh" ? `${sessionStatus?.topLevelThreads ?? 0} 条会话` : `${sessionStatus?.topLevelThreads ?? 0} sessions`}</span>
-                  {(sessionStatus?.subagentThreads ?? 0) > 0 && (
-                    <span>{lang === "zh"
-                      ? `已折叠 ${sessionStatus?.subagentThreads ?? 0} 个内部子会话`
-                      : `${sessionStatus?.subagentThreads ?? 0} internal subthreads collapsed`}</span>
-                  )}
-                  {sessionStatus?.needsSync && <span className="session-summary-warning">{lang === "zh" ? `${unsyncedChatCount} 条需修复` : `${unsyncedChatCount} need repair`}</span>}
                 </div>
 
                 <div className="session-list-card">
@@ -2771,8 +2770,8 @@ function App() {
                       <p className="eyebrow">{lang === "zh" ? "本地会话" : "Local threads"}</p>
                       <h4>{lang === "zh" ? "会话列表" : "Sessions"}</h4>
                     </div>
-                    <span title={sessionPreviewTruncated ? (lang === "zh" ? `当前加载最近 ${sessionStatus?.sessions.length ?? 0} 条` : `Latest ${sessionStatus?.sessions.length ?? 0} loaded`) : undefined}>
-                      {lang === "zh" ? `展示 ${filteredSessions.length} / ${sessionStatus?.topLevelThreads ?? 0} 条` : `${filteredSessions.length} / ${sessionStatus?.topLevelThreads ?? 0} shown`}
+                    <span title={sessionPreviewTruncated ? (lang === "zh" ? `当前加载 ${visibleSessions.length} 条` : `${visibleSessions.length} loaded`) : undefined}>
+                      {lang === "zh" ? `展示 ${filteredSessions.length} / ${sessionVisibleTotal} 条` : `${filteredSessions.length} / ${sessionVisibleTotal} shown`}
                     </span>
                   </div>
 
@@ -2786,13 +2785,29 @@ function App() {
                           setSelectedSessionIds([]);
                           setSessionDeleteConfirmOpen(false);
                         }}
-                        placeholder={lang === "zh" ? "搜索标题 / cwd / Provider / ID" : "Search title / cwd / Provider / ID"}
+                        placeholder={lang === "zh" ? "搜索标题 / 项目 / 供应商 / ID" : "Search title / project / provider / ID"}
                       />
                     </label>
                     <label className="session-toggle">
                       <input type="checkbox" checked={sessionGroupByCwd} onChange={(e) => setSessionGroupByCwd(e.target.checked)} />
                       <span>{lang === "zh" ? "按项目路径分组" : "Group by cwd"}</span>
                     </label>
+                    {(sessionStatus?.subagentThreads ?? 0) > 0 && (
+                      <label className="session-toggle session-internal-toggle">
+                        <input
+                          type="checkbox"
+                          checked={showInternalSessions}
+                          onChange={(e) => {
+                            setShowInternalSessions(e.target.checked);
+                            setSelectedSessionIds([]);
+                            setSessionDeleteConfirmOpen(false);
+                          }}
+                        />
+                        <span>{lang === "zh"
+                          ? `显示内部会话 (${sessionStatus?.subagentThreads ?? 0})`
+                          : `Show internal sessions (${sessionStatus?.subagentThreads ?? 0})`}</span>
+                      </label>
+                    )}
                     <button
                       ref={sessionDeleteTriggerRef}
                       className={cx("small session-delete-trigger", selectedSessionIds.length > 0 ? "danger-btn active" : "secondary-btn")}
@@ -2816,7 +2831,7 @@ function App() {
                         <span aria-hidden="true" />
                         <span>{lang === "zh" ? "会话" : "Session"}</span>
                         <span>{lang === "zh" ? "更新时间" : "Updated"}</span>
-                        <span>Provider</span>
+                        <span>{lang === "zh" ? "供应商" : "Provider"}</span>
                         <span>{lang === "zh" ? "模型" : "Model"}</span>
                         <span>ID</span>
                       </div>
@@ -2865,12 +2880,19 @@ function App() {
                                   <div className="session-row-title">
                                     <strong>{item.title}</strong>
                                     {item.archived && <span className="session-state-text">{lang === "zh" ? "已归档" : "Archived"}</span>}
-                                    {item.needsSync && <span className="session-state-text warn">{lang === "zh" ? "需同步" : "Needs sync"}</span>}
+                                    {item.isSubagent && <span className="mini-tag">{lang === "zh" ? "内部" : "Internal"}</span>}
+                                    {item.needsSync && (
+                                      <span className="session-state-text warn">
+                                        {lang === "zh" ? "待同步" : "Needs sync"}
+                                      </span>
+                                    )}
                                   </div>
                                   {!showGroupHeader && <p title={item.cwd || item.rolloutPath || undefined}>{compactPath(item.cwd || item.rolloutPath, 72)}</p>}
                                 </div>
                                 <span className="session-meta-time" title={item.updatedAtMs ? new Date(item.updatedAtMs).toLocaleString() : undefined}>{formatSessionTime(item.updatedAtMs)}</span>
-                                <code className="session-meta-provider" title={item.modelProvider || undefined}>{item.modelProvider || "unknown"}</code>
+                                <code className="session-meta-provider" title={item.modelProvider || undefined}>
+                                  {item.modelProvider || "unknown"}
+                                </code>
                                 <span className="session-meta-model" title={item.model || undefined}>{item.model || "-"}</span>
                                 <small className="session-meta-id" title={item.id}>#{shortId(item.id)}</small>
                               </label>
@@ -2888,9 +2910,16 @@ function App() {
                 </div>
 
                 {sessionStatus?.warnings?.length ? (
-                  <div className="session-warning-list">
-                    {sessionStatus.warnings.map((item, index) => <p key={index}><AlertCircle size={15} /> {item}</p>)}
-                  </div>
+                  <details className="session-warning-list session-scan-warnings">
+                    <summary>
+                      <Info size={15} />
+                      <span>{lang === "zh" ? "诊断信息" : "Diagnostics"}</span>
+                      <small>{lang === "zh" ? `${sessionStatus.warnings.length} 条 · 点击查看` : `${sessionStatus.warnings.length} · click to view`}</small>
+                    </summary>
+                    <div className="session-warning-items">
+                      {sessionStatus.warnings.map((item, index) => <p key={index}><Info size={15} /> {item}</p>)}
+                    </div>
+                  </details>
                 ) : null}
               </section>
             )}

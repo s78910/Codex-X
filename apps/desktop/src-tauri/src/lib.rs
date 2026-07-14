@@ -1,14 +1,14 @@
 use chrono::Local;
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 mod constants;
@@ -276,14 +276,6 @@ struct StartupDiagnostics {
     items: Vec<DiagnosticItem>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SelectedSessionSyncInput {
-    config_dir: Option<String>,
-    target_provider: Option<String>,
-    session_ids: Vec<String>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionDeleteInput {
@@ -303,6 +295,7 @@ struct SessionPreview {
     updated_at_ms: Option<i64>,
     archived: bool,
     has_user_event: bool,
+    is_subagent: bool,
     needs_sync: bool,
 }
 
@@ -410,10 +403,18 @@ struct RolloutScan {
     session_meta_count: usize,
     mismatched_rollouts: usize,
     mismatched_session_meta: usize,
-    changed_files: Vec<(PathBuf, String)>,
+    changes: Vec<SessionFileChange>,
     thread_ids_with_user_events: HashSet<String>,
     cwd_by_thread_id: HashMap<String, String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionFileChange {
+    path: PathBuf,
+    original_text: String,
+    next_text: String,
+    original_mtime: Option<SystemTime>,
 }
 
 #[derive(Debug, Default)]
@@ -4262,9 +4263,15 @@ fn collect_rollout_paths(root: &Path, out: &mut Vec<PathBuf>, warnings: &mut Vec
             continue;
         };
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_rollout_paths(&path, out, warnings);
-        } else if is_rollout_file(&path) {
+        } else if file_type.is_file() && is_rollout_file(&path) {
             out.push(path);
         }
     }
@@ -4295,12 +4302,12 @@ fn normalize_workspace_path(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn scan_rollouts(
-    codex_dir: &Path,
-    target_provider: &str,
-    rewrite: bool,
-    only_session_ids: Option<&HashSet<String>>,
-) -> Result<RolloutScan> {
+fn is_locked_io_error(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::PermissionDenied)
+        || matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+fn scan_rollouts(codex_dir: &Path, target_provider: &str) -> Result<RolloutScan> {
     let mut paths = Vec::new();
     let mut scan = RolloutScan::default();
     for dir in ["sessions", "archived_sessions"] {
@@ -4312,51 +4319,38 @@ fn scan_rollouts(
     for path in paths {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(e)
-                if matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
-                    || matches!(e.raw_os_error(), Some(32 | 33)) =>
-            {
+            Err(error) if is_locked_io_error(&error) => {
                 scan.warnings
                     .push(format!("跳过被占用/无权限会话文件: {}", path.display()));
                 continue;
             }
-            Err(e) => return Err(io_err(&path, e)),
+            Err(error) => return Err(io_err(&path, error)),
         };
-        let mut next = String::with_capacity(text.len());
-        let mut file_has_meta = false;
-        let mut file_changed = false;
-        let has_user_event = text.contains("\"user_message\"") || text.contains("\"user_input\"");
-        let mut first_thread_id: Option<String> = None;
-        let mut first_cwd: Option<String> = None;
+        let mut next_text = String::with_capacity(text.len());
+        let mut rewrite_needed = false;
+        let mut file_session_meta_count = 0usize;
+        let mut thread_id = None;
+        let mut cwd = None;
 
         for segment in text.split_inclusive('\n') {
-            let (line, ending) = split_line_ending(segment);
+            let (line, line_ending) = split_line_ending(segment);
             let mut next_line = line.to_string();
             if !line.trim().is_empty() {
                 if let Ok(mut record) = serde_json::from_str::<Value>(line) {
                     if record.get("type").and_then(Value::as_str) == Some("session_meta") {
-                        file_has_meta = true;
-                        scan.session_meta_count += 1;
                         if let Some(payload) =
                             record.get_mut("payload").and_then(Value::as_object_mut)
                         {
-                            if first_thread_id.is_none() {
-                                first_thread_id = payload
+                            file_session_meta_count += 1;
+                            scan.session_meta_count += 1;
+                            if thread_id.is_none() {
+                                thread_id = payload
                                     .get("id")
                                     .and_then(Value::as_str)
                                     .map(ToString::to_string);
                             }
-                            let selected_for_rewrite = only_session_ids
-                                .map(|ids| {
-                                    payload
-                                        .get("id")
-                                        .and_then(Value::as_str)
-                                        .map(|id| ids.contains(id))
-                                        .unwrap_or(false)
-                                })
-                                .unwrap_or(true);
-                            if first_cwd.is_none() {
-                                first_cwd = payload
+                            if cwd.is_none() {
+                                cwd = payload
                                     .get("cwd")
                                     .and_then(Value::as_str)
                                     .and_then(normalize_workspace_path);
@@ -4364,44 +4358,149 @@ fn scan_rollouts(
                             if payload.get("model_provider").and_then(Value::as_str)
                                 != Some(target_provider)
                             {
+                                payload.insert(
+                                    "model_provider".to_string(),
+                                    Value::String(target_provider.to_string()),
+                                );
+                                next_line = serde_json::to_string(&record)
+                                    .map_err(|error| json_err(&path, error))?;
+                                rewrite_needed = true;
                                 scan.mismatched_session_meta += 1;
-                                if selected_for_rewrite {
-                                    file_changed = true;
-                                }
-                                if rewrite && selected_for_rewrite {
-                                    payload.insert(
-                                        "model_provider".to_string(),
-                                        json!(target_provider),
-                                    );
-                                    next_line = serde_json::to_string(&record)
-                                        .map_err(|e| json_err(&path, e))?;
-                                }
                             }
                         }
                     }
                 }
             }
-            next.push_str(&next_line);
-            next.push_str(ending);
+            next_text.push_str(&next_line);
+            next_text.push_str(line_ending);
         }
-        if file_has_meta {
-            if has_user_event {
-                if let Some(id) = &first_thread_id {
-                    scan.thread_ids_with_user_events.insert(id.clone());
-                }
+
+        if file_session_meta_count == 0 {
+            continue;
+        }
+        if let Some(thread_id) = thread_id {
+            if text.contains("\"user_message\"") || text.contains("\"user_input\"") {
+                scan.thread_ids_with_user_events.insert(thread_id.clone());
             }
-            if let (Some(id), Some(cwd)) = (&first_thread_id, &first_cwd) {
-                scan.cwd_by_thread_id.insert(id.clone(), cwd.clone());
+            if let Some(cwd) = cwd {
+                scan.cwd_by_thread_id.insert(thread_id, cwd);
             }
         }
-        if file_changed {
+        if rewrite_needed {
             scan.mismatched_rollouts += 1;
-            if rewrite {
-                scan.changed_files.push((path, next));
+            scan.changes.push(SessionFileChange {
+                original_mtime: fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
+                path,
+                original_text: text,
+                next_text,
+            });
+        }
+    }
+    let projectless = projectless_thread_ids(&codex_dir.join(".codex-global-state.json"))?;
+    scan.cwd_by_thread_id
+        .retain(|thread_id, _| !projectless.contains(thread_id));
+    Ok(scan)
+}
+
+fn restore_file_mtime(path: &Path, mtime: Option<SystemTime>) {
+    let Some(mtime) = mtime else { return };
+    let Ok(file) = fs::File::options().write(true).open(path) else {
+        return;
+    };
+    let _ = file.set_times(std::fs::FileTimes::new().set_modified(mtime));
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn rollout_file_is_open(path: &Path) -> bool {
+    Command::new("/usr/sbin/lsof")
+        .args(["-t", "--"])
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn rollout_file_is_open(_path: &Path) -> bool {
+    false
+}
+
+fn apply_session_changes(
+    changes: &[SessionFileChange],
+) -> Result<(Vec<SessionFileChange>, Vec<PathBuf>)> {
+    let mut applied = Vec::new();
+    let mut skipped = Vec::new();
+    for change in changes {
+        if rollout_file_is_open(&change.path) {
+            skipped.push(change.path.clone());
+            continue;
+        }
+        match fs::read_to_string(&change.path) {
+            Ok(current) if current == change.original_text => {}
+            Ok(_) => {
+                skipped.push(change.path.clone());
+                continue;
+            }
+            Err(error) if is_locked_io_error(&error) => {
+                skipped.push(change.path.clone());
+                continue;
+            }
+            Err(error) => {
+                let original_error = io_err(&change.path, error);
+                return match restore_session_changes(&applied) {
+                    Ok(()) => Err(original_error),
+                    Err(rollback_error) => Err(CodexxError::Config(format!(
+                        "{original_error}；回滚失败：{rollback_error}"
+                    ))),
+                };
+            }
+        }
+        match atomic_write(&change.path, change.next_text.as_bytes()) {
+            Ok(()) => {
+                restore_file_mtime(&change.path, change.original_mtime);
+                applied.push(change.clone());
+            }
+            Err(error) => {
+                return match restore_session_changes(&applied) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(CodexxError::Config(format!(
+                        "{error}；回滚失败：{rollback_error}"
+                    ))),
+                };
             }
         }
     }
-    Ok(scan)
+    Ok((applied, skipped))
+}
+
+fn restore_session_changes(changes: &[SessionFileChange]) -> Result<()> {
+    let mut failed = 0usize;
+    for change in changes {
+        if rollout_file_is_open(&change.path) {
+            failed += 1;
+            continue;
+        }
+        let unchanged =
+            fs::read_to_string(&change.path).is_ok_and(|current| current == change.next_text);
+        if !unchanged {
+            failed += 1;
+            continue;
+        }
+        if atomic_write(&change.path, change.original_text.as_bytes()).is_err() {
+            failed += 1;
+            continue;
+        }
+        restore_file_mtime(&change.path, change.original_mtime);
+    }
+    if failed > 0 {
+        return Err(CodexxError::Config(format!(
+            "有 {failed} 个会话文件无法安全回滚；文件正在使用或已发生变化。"
+        )));
+    }
+    Ok(())
 }
 
 fn expand_sqlite_home(codex_dir: &Path, value: &str) -> PathBuf {
@@ -4532,6 +4631,67 @@ fn sqlite_candidate_paths(codex_dir: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Mirrors Codex++ provider sync: visit every current SQLite session database,
+/// then the legacy root state database. This is intentionally separate from
+/// `sqlite_candidate_paths`, which identifies the single active database used
+/// by destructive session deletion verification.
+fn sqlite_session_db_paths(codex_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(configured) = configured_sqlite_home(codex_dir) {
+        roots.push(configured);
+    }
+    roots.push(codex_dir.join("sqlite"));
+
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        let mut candidates = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("db" | "sqlite" | "sqlite3")
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|path| {
+            (
+                path.file_name()
+                    .is_none_or(|name| name != std::ffi::OsStr::new("codex-dev.db")),
+                path.file_name().map(|name| name.to_os_string()),
+            )
+        });
+        for path in candidates {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let Ok(conn) = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) else {
+                continue;
+            };
+            let is_session_db = ["threads", "automation_runs", "inbox_items"]
+                .iter()
+                .any(|table| sqlite_has_table(&conn, table).unwrap_or(false));
+            if is_session_db {
+                paths.push(path);
+            }
+        }
+    }
+
+    let legacy = codex_dir.join("state_5.sqlite");
+    if legacy.exists() && seen.insert(legacy.clone()) {
+        paths.push(legacy);
+    }
+    paths
+}
+
 fn sqlite_has_table(conn: &Connection, table: &str) -> Result<bool> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
@@ -4645,9 +4805,53 @@ fn sqlite_subagent_thread_ids(
     Ok(ids)
 }
 
-fn scan_sqlite(codex_dir: &Path, target_provider: &str) -> Result<SqliteScan> {
+struct SqliteThreadIndexState<'a> {
+    thread_id: &'a str,
+    provider: Option<&'a str>,
+    has_user_event: Option<i64>,
+    cwd: Option<&'a str>,
+    has_user_event_column: bool,
+    cwd_column: bool,
+}
+
+fn sqlite_thread_needs_alignment(
+    rollouts: &RolloutScan,
+    target_provider: &str,
+    state: &SqliteThreadIndexState<'_>,
+) -> bool {
+    if state.provider.map(str::trim).unwrap_or_default() != target_provider {
+        return true;
+    }
+    if state.has_user_event_column
+        && rollouts
+            .thread_ids_with_user_events
+            .contains(state.thread_id)
+        && state.has_user_event.unwrap_or_default() != 1
+    {
+        return true;
+    }
+    if state.cwd_column {
+        if let Some(expected_cwd) = rollouts.cwd_by_thread_id.get(state.thread_id) {
+            if state.cwd.and_then(normalize_workspace_path).as_deref()
+                != Some(expected_cwd.as_str())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn scan_sqlite(
+    codex_dir: &Path,
+    rollouts: &RolloutScan,
+    target_provider: &str,
+) -> Result<SqliteScan> {
     let mut scan = SqliteScan::default();
-    for path in sqlite_candidate_paths(codex_dir) {
+    let mut thread_ids = HashSet::new();
+    let mut subagent_ids = HashSet::new();
+    let mut mismatched_ids = HashSet::new();
+    for path in sqlite_session_db_paths(codex_dir) {
         let conn = match Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -4663,49 +4867,71 @@ fn scan_sqlite(codex_dir: &Path, target_provider: &str) -> Result<SqliteScan> {
             continue;
         }
         let cols = table_column_set(&conn, "threads")?;
-        if !cols.contains("model_provider") {
+        if !cols.contains("id") || !cols.contains("model_provider") {
             scan.warnings.push(format!(
-                "SQLite threads 缺少 model_provider 字段: {}",
+                "SQLite threads 缺少 id 或 model_provider 字段: {}",
                 path.display()
             ));
             continue;
         }
         scan.sqlite_dbs += 1;
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
+        let has_user_event_col = sql_select_column(&cols, "has_user_event", "NULL");
+        let cwd_col = sql_select_column(&cols, "cwd", "NULL");
+        let query = format!(
+            "SELECT \"id\", \"model_provider\", {has_user_event_col}, {cwd_col} FROM threads"
+        );
+        let mut stmt = conn
+            .prepare(&query)
             .map_err(|e| CodexxError::Database(e.to_string()))?;
-        let mismatch: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
-                [target_provider],
-                |row| row.get(0),
-            )
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
             .map_err(|e| CodexxError::Database(e.to_string()))?;
-        let subagent_threads = if cols.contains("id") {
-            sqlite_subagent_thread_ids(&conn, &cols)?
-                .len()
-                .min(total.max(0) as usize)
-        } else {
-            0
-        };
-        scan.sqlite_threads += total.max(0) as usize;
-        scan.top_level_threads += (total.max(0) as usize).saturating_sub(subagent_threads);
-        scan.subagent_threads += subagent_threads;
-        scan.mismatched_threads += mismatch.max(0) as usize;
+        for row in rows {
+            let (id, provider, has_user_event, cwd) =
+                row.map_err(|e| CodexxError::Database(e.to_string()))?;
+            thread_ids.insert(id.clone());
+            if sqlite_thread_needs_alignment(
+                rollouts,
+                target_provider,
+                &SqliteThreadIndexState {
+                    thread_id: &id,
+                    provider: provider.as_deref(),
+                    has_user_event,
+                    cwd: cwd.as_deref(),
+                    has_user_event_column: cols.contains("has_user_event"),
+                    cwd_column: cols.contains("cwd"),
+                },
+            ) {
+                mismatched_ids.insert(id);
+            }
+        }
+        subagent_ids.extend(sqlite_subagent_thread_ids(&conn, &cols)?);
     }
+    subagent_ids.retain(|id| thread_ids.contains(id));
+    scan.sqlite_threads = thread_ids.len();
+    scan.subagent_threads = subagent_ids.len();
+    scan.top_level_threads = thread_ids.len().saturating_sub(subagent_ids.len());
+    scan.mismatched_threads = mismatched_ids.len();
     Ok(scan)
 }
 
 fn list_session_previews(
     codex_dir: &Path,
+    rollouts: &RolloutScan,
     target_provider: &str,
     limit: usize,
 ) -> Result<(Vec<SessionPreview>, Vec<String>)> {
-    let mut sessions = Vec::new();
+    let mut candidates = Vec::new();
     let mut warnings = Vec::new();
-    let mut seen = HashSet::new();
 
-    for path in sqlite_candidate_paths(codex_dir) {
+    for path in sqlite_session_db_paths(codex_dir) {
         let conn = match Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -4776,6 +5002,24 @@ fn list_session_previews(
                     .as_ref()
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty());
+                let normalized_cwd = cwd.as_deref().and_then(normalize_workspace_path);
+                let normalized_rollout_path = rollout_path
+                    .as_ref()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                let needs_sync = sqlite_thread_needs_alignment(
+                    rollouts,
+                    target_provider,
+                    &SqliteThreadIndexState {
+                        thread_id: &id,
+                        provider: normalized_provider.as_deref(),
+                        has_user_event: Some(has_user_event),
+                        cwd: normalized_cwd.as_deref(),
+                        has_user_event_column: cols.contains("has_user_event"),
+                        cwd_column: cols.contains("cwd"),
+                    },
+                );
+                let is_subagent = subagent_thread_ids.contains(&id);
                 Ok(SessionPreview {
                     id,
                     title: clean_title,
@@ -4784,38 +5028,34 @@ fn list_session_previews(
                         let v = v.trim().to_string();
                         (!v.is_empty()).then_some(v)
                     }),
-                    cwd: cwd.and_then(|v| {
-                        let v = v.trim().to_string();
-                        (!v.is_empty()).then_some(v)
-                    }),
-                    rollout_path: rollout_path.and_then(|v| {
-                        let v = v.trim().to_string();
-                        (!v.is_empty()).then_some(v)
-                    }),
+                    cwd: normalized_cwd,
+                    rollout_path: normalized_rollout_path,
                     updated_at_ms: updated_at_ms.or_else(|| updated_at.map(|v| v * 1000)),
                     archived: archived != 0,
                     has_user_event: has_user_event != 0,
-                    needs_sync: normalized_provider.as_deref() != Some(target_provider),
+                    is_subagent,
+                    needs_sync,
                 })
             })
             .map_err(|e| CodexxError::Database(e.to_string()))?;
 
         for row in rows {
             let session = row.map_err(|e| CodexxError::Database(e.to_string()))?;
-            if subagent_thread_ids.contains(&session.id) {
-                continue;
-            }
-            if seen.insert(session.id.clone()) {
-                sessions.push(session);
-                if sessions.len() >= limit.max(1) {
-                    break;
-                }
-            }
+            candidates.push(session);
         }
     }
 
-    sessions.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
-    sessions.truncate(limit);
+    candidates.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut seen = HashSet::new();
+    let sessions = candidates
+        .into_iter()
+        .filter(|session| seen.insert(session.id.clone()))
+        .take(limit.max(1))
+        .collect();
     Ok((sessions, warnings))
 }
 
@@ -4823,16 +5063,103 @@ fn provider_sync_backup_root(codex_dir: &Path) -> PathBuf {
     codex_dir.join("backups_state").join("provider-sync")
 }
 
+fn backup_relative_path(codex_dir: &Path, source: &Path) -> PathBuf {
+    match source.strip_prefix(codex_dir) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+        _ => {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(source.to_string_lossy().as_bytes());
+            let key = digest[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            PathBuf::from("external").join(key).join(
+                source
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("file")),
+            )
+        }
+    }
+}
+
+fn backup_target_path(codex_dir: &Path, backup_dir: &Path, source: &Path) -> Result<PathBuf> {
+    let target = backup_dir.join(backup_relative_path(codex_dir, source));
+    if target == source {
+        return Err(CodexxError::Config(format!(
+            "拒绝将备份写回源文件: {}",
+            source.display()
+        )));
+    }
+    Ok(target)
+}
+
 fn copy_file_to_backup(codex_dir: &Path, backup_dir: &Path, source: &Path) -> Result<()> {
     if !source.exists() {
         return Ok(());
     }
-    let relative = source.strip_prefix(codex_dir).unwrap_or(source);
-    let target = backup_dir.join(relative);
+    let target = backup_target_path(codex_dir, backup_dir, source)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
     }
-    fs::copy(source, &target).map_err(|e| io_err(source, e))?;
+    fs::copy(source, &target).map_err(|e| io_err(&target, e))?;
+    Ok(())
+}
+
+fn backup_sqlite_to_backup(codex_dir: &Path, backup_dir: &Path, source: &Path) -> Result<()> {
+    use rusqlite::backup::{Backup, StepResult};
+
+    if !source.exists() {
+        return Ok(());
+    }
+    let target = backup_target_path(codex_dir, backup_dir, source)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    }
+    let from = Connection::open_with_flags(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| {
+        CodexxError::Database(format!("打开 SQLite 备份源失败 {}: {e}", source.display()))
+    })?;
+    from.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let mut to = Connection::open(&target).map_err(|e| {
+        CodexxError::Database(format!("创建 SQLite 备份失败 {}: {e}", target.display()))
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    {
+        let backup = Backup::new(&from, &mut to)
+            .map_err(|e| CodexxError::Database(format!("初始化 SQLite 快照失败: {e}")))?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(CodexxError::Database(format!(
+                    "SQLite 快照超时: {}",
+                    source.display()
+                )));
+            }
+            match backup
+                .step(128)
+                .map_err(|e| CodexxError::Database(format!("写入 SQLite 快照失败: {e}")))?
+            {
+                StepResult::Done => break,
+                StepResult::More => {}
+                StepResult::Busy | StepResult::Locked => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => {}
+            }
+        }
+    }
+    let quick_check: String = to
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|e| CodexxError::Database(format!("校验 SQLite 备份失败: {e}")))?;
+    if quick_check != "ok" {
+        return Err(CodexxError::Database(format!(
+            "SQLite 备份校验失败 {}: {quick_check}",
+            target.display()
+        )));
+    }
     Ok(())
 }
 
@@ -4845,7 +5172,18 @@ fn prune_provider_sync_backups(codex_dir: &Path) -> Result<()> {
     for entry in fs::read_dir(&root).map_err(|e| io_err(&root, e))? {
         let entry = entry.map_err(|e| io_err(&root, e))?;
         let path = entry.path();
-        if path.is_dir() && path.join("metadata.json").exists() {
+        let metadata_path = path.join("metadata.json");
+        if !path.is_dir() || !metadata_path.exists() {
+            continue;
+        }
+        let is_v2_provider_sync_backup = fs::read_to_string(&metadata_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|metadata| {
+                metadata.get("managedBy").and_then(Value::as_str)
+                    == Some("Codex-X provider sync v2")
+            });
+        if is_v2_provider_sync_backup {
             dirs.push(path);
         }
     }
@@ -4878,14 +5216,8 @@ fn create_provider_sync_backup(
     ] {
         copy_file_to_backup(codex_dir, &backup_dir, &codex_dir.join(name))?;
     }
-    for path in sqlite_candidate_paths(codex_dir) {
-        for candidate in [
-            path.clone(),
-            PathBuf::from(format!("{}-wal", path.display())),
-            PathBuf::from(format!("{}-shm", path.display())),
-        ] {
-            copy_file_to_backup(codex_dir, &backup_dir, &candidate)?;
-        }
+    for path in sqlite_session_db_paths(codex_dir) {
+        backup_sqlite_to_backup(codex_dir, &backup_dir, &path)?;
     }
     for path in changed_rollouts {
         copy_file_to_backup(codex_dir, &backup_dir, path)?;
@@ -4895,76 +5227,50 @@ fn create_provider_sync_backup(
         &json!({
             "version": 1,
             "namespace": "provider-sync",
-            "managedBy": "Codex-X session manager",
+            "managedBy": "Codex-X provider sync v2",
             "codexHome": codex_dir.display().to_string(),
             "targetProvider": target_provider,
             "createdAt": Local::now().to_rfc3339(),
             "changedRolloutFiles": changed_rollouts.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         }),
     )?;
-    prune_provider_sync_backups(codex_dir)?;
     Ok(backup_dir)
 }
 
-fn update_selected_thread_provider(
-    tx: &rusqlite::Transaction<'_>,
-    cols: &HashSet<String>,
-    target_provider: &str,
-    selected_ids: &HashSet<String>,
-    thread_ids_with_user_events: &HashSet<String>,
-    cwd_by_thread_id: &HashMap<String, String>,
-) -> Result<usize> {
-    let mut updated = 0usize;
-    for id in selected_ids {
-        updated += tx
-            .execute(
-                "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
-                (target_provider, id),
-            )
-            .map_err(|e| CodexxError::Database(e.to_string()))?;
-        if cols.contains("has_user_event") && thread_ids_with_user_events.contains(id) {
-            updated += tx
-                .execute(
-                    "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
-                    [id],
-                )
-                .map_err(|e| CodexxError::Database(e.to_string()))?;
-        }
-        if cols.contains("cwd") {
-            if let Some(cwd) = cwd_by_thread_id.get(id) {
-                updated += tx
-                    .execute(
-                        "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
-                        (cwd, id),
-                    )
-                    .map_err(|e| CodexxError::Database(e.to_string()))?;
-            }
-        }
-    }
-    Ok(updated)
+#[derive(Debug, Default)]
+struct SqliteUpdateCounts {
+    provider_rows: usize,
+    user_event_rows: usize,
+    cwd_rows: usize,
 }
 
-fn apply_sqlite_provider_sync_selected(
-    codex_dir: &Path,
-    target_provider: &str,
-    selected_ids: &HashSet<String>,
-    thread_ids_with_user_events: &HashSet<String>,
-    cwd_by_thread_id: &HashMap<String, String>,
-) -> Result<usize> {
-    let mut updated = 0usize;
-    if selected_ids.is_empty() {
-        return Ok(0);
+impl SqliteUpdateCounts {
+    fn total(&self) -> usize {
+        self.provider_rows + self.user_event_rows + self.cwd_rows
     }
-    for path in sqlite_candidate_paths(codex_dir) {
-        let mut conn = match Connection::open(&path) {
-            Ok(conn) => conn,
-            Err(e) => {
-                return Err(CodexxError::Database(format!(
-                    "打开 SQLite 失败 {}: {e}",
-                    path.display()
-                )))
-            }
-        };
+
+    fn add(&mut self, other: Self) {
+        self.provider_rows += other.provider_rows;
+        self.user_event_rows += other.user_event_rows;
+        self.cwd_rows += other.cwd_rows;
+    }
+}
+
+fn apply_sqlite_provider_alignment(
+    codex_dir: &Path,
+    rollouts: &RolloutScan,
+    target_provider: &str,
+) -> Result<SqliteUpdateCounts> {
+    let mut updated = SqliteUpdateCounts::default();
+    for path in sqlite_session_db_paths(codex_dir) {
+        if !path.exists() {
+            continue;
+        }
+        let mut conn = Connection::open(&path).map_err(|error| {
+            CodexxError::Database(format!("打开 SQLite 失败 {}: {error}", path.display()))
+        })?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| CodexxError::Database(error.to_string()))?;
         if !sqlite_has_table(&conn, "threads")? {
             continue;
         }
@@ -4973,74 +5279,183 @@ fn apply_sqlite_provider_sync_selected(
             continue;
         }
         let tx = conn
-            .transaction()
-            .map_err(|e| CodexxError::Database(e.to_string()))?;
-        updated += update_selected_thread_provider(
-            &tx,
-            &cols,
-            target_provider,
-            selected_ids,
-            thread_ids_with_user_events,
-            cwd_by_thread_id,
-        )?;
-        tx.commit()
-            .map_err(|e| CodexxError::Database(e.to_string()))?;
-    }
-    Ok(updated)
-}
-
-fn apply_sqlite_provider_sync(
-    codex_dir: &Path,
-    target_provider: &str,
-    thread_ids_with_user_events: &HashSet<String>,
-    cwd_by_thread_id: &HashMap<String, String>,
-) -> Result<usize> {
-    let mut updated = 0usize;
-    for path in sqlite_candidate_paths(codex_dir) {
-        let mut conn = match Connection::open(&path) {
-            Ok(conn) => conn,
-            Err(e) => {
-                return Err(CodexxError::Database(format!(
-                    "打开 SQLite 失败 {}: {e}",
-                    path.display()
-                )))
-            }
-        };
-        if !sqlite_has_table(&conn, "threads")? {
-            continue;
-        }
-        let cols = table_column_set(&conn, "threads")?;
-        if !cols.contains("model_provider") {
-            continue;
-        }
-        let tx = conn
-            .transaction()
-            .map_err(|e| CodexxError::Database(e.to_string()))?;
-        updated += tx
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CodexxError::Database(error.to_string()))?;
+        let mut counts = SqliteUpdateCounts::default();
+        counts.provider_rows = tx
             .execute(
                 "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
                 [target_provider],
             )
-            .map_err(|e| CodexxError::Database(e.to_string()))?;
-        if cols.contains("has_user_event") {
-            for id in thread_ids_with_user_events {
-                updated += tx
-                    .execute("UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1", [id])
-                    .map_err(|e| CodexxError::Database(e.to_string()))?;
+            .map_err(|error| CodexxError::Database(error.to_string()))?;
+
+        if cols.contains("id") && cols.contains("has_user_event") {
+            for thread_id in &rollouts.thread_ids_with_user_events {
+                counts.user_event_rows += tx
+                    .execute(
+                        "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
+                        [thread_id],
+                    )
+                    .map_err(|error| CodexxError::Database(error.to_string()))?;
             }
         }
-        if cols.contains("cwd") {
-            for (id, cwd) in cwd_by_thread_id {
-                updated += tx
+        if cols.contains("id") && cols.contains("cwd") {
+            for (thread_id, cwd) in &rollouts.cwd_by_thread_id {
+                counts.cwd_rows += tx
                     .execute(
                         "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
-                        (cwd, id),
+                        (cwd, thread_id),
                     )
-                    .map_err(|e| CodexxError::Database(e.to_string()))?;
+                    .map_err(|error| CodexxError::Database(error.to_string()))?;
             }
         }
         tx.commit()
-            .map_err(|e| CodexxError::Database(e.to_string()))?;
+            .map_err(|error| CodexxError::Database(error.to_string()))?;
+        updated.add(counts);
+    }
+    Ok(updated)
+}
+
+fn load_global_state(path: &Path) -> Result<Map<String, Value>> {
+    if !path.exists() {
+        return Ok(Map::new());
+    }
+    let text = fs::read_to_string(path).map_err(|error| io_err(path, error))?;
+    let value = serde_json::from_str::<Value>(&text).map_err(|error| json_err(path, error))?;
+    Ok(value.as_object().cloned().unwrap_or_default())
+}
+
+fn projectless_thread_ids(path: &Path) -> Result<HashSet<String>> {
+    let state = load_global_state(path)?;
+    Ok(state
+        .get("projectless-thread-ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn normalized_path_array(value: &Value) -> Vec<String> {
+    if let Some(items) = value.as_array() {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(normalize_workspace_path)
+            .collect()
+    } else {
+        value
+            .as_str()
+            .and_then(normalize_workspace_path)
+            .into_iter()
+            .collect()
+    }
+}
+
+fn dedupe_workspace_paths(paths: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| {
+            seen.insert(
+                path.replace('/', r"\")
+                    .trim_end_matches('\\')
+                    .to_ascii_lowercase(),
+            )
+        })
+        .collect()
+}
+
+fn normalized_global_state(state: &Map<String, Value>) -> Map<String, Value> {
+    let mut next = Map::new();
+    for key in ["electron-saved-workspace-roots", "project-order"] {
+        if let Some(value) = state.get(key) {
+            next.insert(
+                key.to_string(),
+                json!(dedupe_workspace_paths(normalized_path_array(value))),
+            );
+        }
+    }
+    if let Some(value) = state.get("active-workspace-roots") {
+        let normalized = dedupe_workspace_paths(normalized_path_array(value));
+        let next_value = if value.is_array() {
+            json!(normalized)
+        } else if let Some(first) = normalized.first() {
+            json!(first)
+        } else {
+            value.clone()
+        };
+        next.insert("active-workspace-roots".to_string(), next_value);
+    }
+    if let Some(labels) = state
+        .get("electron-workspace-root-labels")
+        .and_then(Value::as_object)
+    {
+        let mut normalized = Map::new();
+        for (path, value) in labels {
+            normalized.insert(
+                normalize_workspace_path(path).unwrap_or_else(|| path.clone()),
+                value.clone(),
+            );
+        }
+        next.insert(
+            "electron-workspace-root-labels".to_string(),
+            Value::Object(normalized),
+        );
+    }
+    if let Some(open_targets) = state
+        .get("open-in-target-preferences")
+        .and_then(Value::as_object)
+    {
+        let mut normalized = open_targets.clone();
+        if let Some(per_path) = open_targets.get("perPath").and_then(Value::as_object) {
+            let mut normalized_per_path = Map::new();
+            for (path, value) in per_path {
+                normalized_per_path.insert(
+                    normalize_workspace_path(path).unwrap_or_else(|| path.clone()),
+                    value.clone(),
+                );
+            }
+            normalized.insert("perPath".to_string(), Value::Object(normalized_per_path));
+        }
+        next.insert(
+            "open-in-target-preferences".to_string(),
+            Value::Object(normalized),
+        );
+    }
+    next
+}
+
+fn count_global_state_updates(path: &Path) -> Result<usize> {
+    let state = load_global_state(path)?;
+    let next = normalized_global_state(&state);
+    Ok(next
+        .iter()
+        .filter(|(key, value)| state.get(*key) != Some(*value))
+        .count())
+}
+
+fn apply_global_state_update(path: &Path) -> Result<usize> {
+    let mut state = load_global_state(path)?;
+    let next = normalized_global_state(&state);
+    let updated = next
+        .iter()
+        .filter(|(key, value)| state.get(*key) != Some(*value))
+        .count();
+    if updated > 0 {
+        for (key, value) in next {
+            state.insert(key, value);
+        }
+        let text = serde_json::to_string_pretty(&Value::Object(state))
+            .map_err(|error| json_err(path, error))?;
+        fs::write(path, &text).map_err(|error| io_err(path, error))?;
+        if let Some(parent) = path.parent() {
+            let backup = parent.join(".codex-global-state.json.bak");
+            fs::write(&backup, text).map_err(|error| io_err(&backup, error))?;
+        }
     }
     Ok(updated)
 }
@@ -5151,10 +5566,13 @@ fn session_sync_status_inner(
 ) -> Result<SessionSyncStatus> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     let target = current_model_provider(&codex_dir, target_provider)?;
-    let rollouts = scan_rollouts(&codex_dir, &target, false, None)?;
-    let sqlite = scan_sqlite(&codex_dir, &target)?;
-    let session_limit = sqlite.top_level_threads.max(50).min(1000);
-    let (sessions, session_warnings) = list_session_previews(&codex_dir, &target, session_limit)?;
+    let rollouts = scan_rollouts(&codex_dir, &target)?;
+    let sqlite = scan_sqlite(&codex_dir, &rollouts, &target)?;
+    let global_state_updates =
+        count_global_state_updates(&codex_dir.join(".codex-global-state.json"))?;
+    let session_limit = sqlite.sqlite_threads.max(50).min(1000);
+    let (sessions, session_warnings) =
+        list_session_previews(&codex_dir, &rollouts, &target, session_limit)?;
     let mut warnings = rollouts.warnings;
     warnings.extend(sqlite.warnings);
     warnings.extend(session_warnings);
@@ -5170,7 +5588,9 @@ fn session_sync_status_inner(
         top_level_threads: sqlite.top_level_threads,
         subagent_threads: sqlite.subagent_threads,
         mismatched_threads: sqlite.mismatched_threads,
-        needs_sync: rollouts.mismatched_session_meta > 0 || sqlite.mismatched_threads > 0,
+        needs_sync: rollouts.mismatched_rollouts > 0
+            || sqlite.mismatched_threads > 0
+            || global_state_updates > 0,
         backup_dir: None,
         warnings,
         sessions,
@@ -5387,10 +5807,12 @@ struct ActiveSessionStorageSnapshot {
 }
 
 fn active_session_storage_snapshot(
+    codex_dir: &Path,
     active_database_paths: &[PathBuf],
-    target_provider: &str,
 ) -> Result<ActiveSessionStorageSnapshot> {
     let mut snapshot = ActiveSessionStorageSnapshot::default();
+    let target_provider = current_model_provider(codex_dir, None)?;
+    let rollouts = scan_rollouts(codex_dir, &target_provider)?;
     for path in active_database_paths {
         let conn = Connection::open_with_flags(
             path,
@@ -5432,16 +5854,40 @@ fn active_session_storage_snapshot(
             .extend(sqlite_subagent_thread_ids(&conn, &cols)?);
 
         if cols.contains("model_provider") {
+            let has_user_event_col = sql_select_column(&cols, "has_user_event", "NULL");
+            let cwd_col = sql_select_column(&cols, "cwd", "NULL");
+            let query =
+                format!("SELECT id, model_provider, {has_user_event_col}, {cwd_col} FROM threads");
             let mut mismatch_stmt = conn
-                .prepare("SELECT id FROM threads WHERE COALESCE(model_provider, '') <> ?1")
+                .prepare(&query)
                 .map_err(|error| CodexxError::Database(error.to_string()))?;
             let mismatches = mismatch_stmt
-                .query_map([target_provider], |row| row.get::<_, String>(0))
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
                 .map_err(|error| CodexxError::Database(error.to_string()))?;
-            for id in mismatches {
-                snapshot
-                    .mismatched_ids
-                    .insert(id.map_err(|error| CodexxError::Database(error.to_string()))?);
+            for row in mismatches {
+                let (id, provider, has_user_event, cwd) =
+                    row.map_err(|error| CodexxError::Database(error.to_string()))?;
+                if sqlite_thread_needs_alignment(
+                    &rollouts,
+                    &target_provider,
+                    &SqliteThreadIndexState {
+                        thread_id: &id,
+                        provider: provider.as_deref(),
+                        has_user_event,
+                        cwd: cwd.as_deref(),
+                        has_user_event_column: cols.contains("has_user_event"),
+                        cwd_column: cols.contains("cwd"),
+                    },
+                ) {
+                    snapshot.mismatched_ids.insert(id);
+                }
             }
         }
     }
@@ -6176,8 +6622,7 @@ fn delete_codex_sessions_inner(input: SessionDeleteInput) -> Result<SessionDelet
     }
     let verification_ids = expected_ids.clone();
     let status_before = session_sync_status_inner(Some(codex_dir.display().to_string()), None)?;
-    let storage_before =
-        active_session_storage_snapshot(&active_database_paths, &status_before.target_provider)?;
+    let storage_before = active_session_storage_snapshot(&codex_dir, &active_database_paths)?;
     // Validate and collect every filesystem target before the official API can
     // make the deletion irreversible.
     let expected_rollout_paths = selected_rollout_paths(&codex_dir, &expected_ids)?;
@@ -6266,8 +6711,7 @@ fn delete_codex_sessions_inner(input: SessionDeleteInput) -> Result<SessionDelet
             fallback.mismatched_threads = fallback
                 .mismatched_threads
                 .saturating_sub(deleted_mismatched);
-            fallback.needs_sync =
-                fallback.mismatched_session_meta > 0 || fallback.mismatched_threads > 0;
+            fallback.needs_sync = fallback.mismatched_threads > 0;
             fallback.warnings.push(message);
             fallback
         }
@@ -6304,94 +6748,72 @@ fn delete_codex_sessions_inner(input: SessionDeleteInput) -> Result<SessionDelet
     })
 }
 
-fn sync_selected_sessions_provider_inner(
-    input: SelectedSessionSyncInput,
-) -> Result<SessionSyncResult> {
-    let selected_ids = input
-        .session_ids
-        .into_iter()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .collect::<HashSet<_>>();
-    if selected_ids.is_empty() {
-        return Err(CodexxError::Config("请选择至少一个会话".to_string()));
-    }
-
-    let codex_dir = resolve_codex_dir(input.config_dir)?;
-    fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
-    let target = current_model_provider(&codex_dir, input.target_provider)?;
-    let _maintenance_lock = acquire_session_maintenance_lock(&codex_dir)?;
-    let rollouts = scan_rollouts(&codex_dir, &target, true, Some(&selected_ids))?;
-    let changed_paths = rollouts
-        .changed_files
-        .iter()
-        .map(|(p, _)| p.clone())
-        .collect::<Vec<_>>();
-    let backup_dir = create_provider_sync_backup(&codex_dir, &target, &changed_paths)?;
-
-    let mut updated_rollouts = 0usize;
-    for (path, text) in &rollouts.changed_files {
-        write_text(path, text)?;
-        updated_rollouts += 1;
-    }
-    let updated_threads = apply_sqlite_provider_sync_selected(
-        &codex_dir,
-        &target,
-        &selected_ids,
-        &rollouts.thread_ids_with_user_events,
-        &rollouts.cwd_by_thread_id,
-    )?;
-    let mut status =
-        session_sync_status_inner(Some(codex_dir.display().to_string()), Some(target.clone()))?;
-    status.backup_dir = Some(backup_dir.display().to_string());
-    Ok(SessionSyncResult {
-        status,
-        updated_rollouts,
-        updated_threads,
-        backup_dir: backup_dir.display().to_string(),
-    })
-}
-
 fn sync_sessions_provider_inner(
     config_dir: Option<String>,
     target_provider: Option<String>,
 ) -> Result<SessionSyncResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
-    fs::create_dir_all(&codex_dir).map_err(|e| io_err(&codex_dir, e))?;
-    let target = current_model_provider(&codex_dir, target_provider)?;
+    fs::create_dir_all(&codex_dir).map_err(|error| io_err(&codex_dir, error))?;
+    let target_provider = current_model_provider(&codex_dir, target_provider)?;
     let _maintenance_lock = acquire_session_maintenance_lock(&codex_dir)?;
-    let rollouts = scan_rollouts(&codex_dir, &target, true, None)?;
-    let sqlite_before = scan_sqlite(&codex_dir, &target)?;
-    let changed_paths = rollouts
-        .changed_files
-        .iter()
-        .map(|(p, _)| p.clone())
-        .collect::<Vec<_>>();
-    let backup_dir = create_provider_sync_backup(&codex_dir, &target, &changed_paths)?;
+    let rollouts = scan_rollouts(&codex_dir, &target_provider)?;
+    let sqlite = scan_sqlite(&codex_dir, &rollouts, &target_provider)?;
+    let global_state_path = codex_dir.join(".codex-global-state.json");
+    let global_state_updates = count_global_state_updates(&global_state_path)?;
 
-    let mut updated_rollouts = 0usize;
-    for (path, text) in &rollouts.changed_files {
-        write_text(path, text)?;
-        updated_rollouts += 1;
+    if rollouts.changes.is_empty() && sqlite.mismatched_threads == 0 && global_state_updates == 0 {
+        let status = session_sync_status_inner(
+            Some(codex_dir.display().to_string()),
+            Some(target_provider),
+        )?;
+        return Ok(SessionSyncResult {
+            status,
+            updated_rollouts: 0,
+            updated_threads: 0,
+            backup_dir: String::new(),
+        });
     }
-    let updated_threads = apply_sqlite_provider_sync(
-        &codex_dir,
-        &target,
-        &rollouts.thread_ids_with_user_events,
-        &rollouts.cwd_by_thread_id,
-    )?;
+
+    let changed_rollouts = rollouts
+        .changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
+    let backup_dir = create_provider_sync_backup(&codex_dir, &target_provider, &changed_rollouts)?;
+    let (applied_rollouts, skipped_rollouts) = apply_session_changes(&rollouts.changes)?;
+
+    let apply_result = (|| -> Result<SqliteUpdateCounts> {
+        let sqlite_updates =
+            apply_sqlite_provider_alignment(&codex_dir, &rollouts, &target_provider)?;
+        apply_global_state_update(&global_state_path)?;
+        Ok(sqlite_updates)
+    })();
+    let sqlite_updates = match apply_result {
+        Ok(updates) => updates,
+        Err(error) => {
+            if let Err(rollback_error) = restore_session_changes(&applied_rollouts) {
+                return Err(CodexxError::Config(format!(
+                    "同步失败，恢复会话文件时也失败：{error}；{rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+    prune_provider_sync_backups(&codex_dir)?;
+
     let mut status =
-        session_sync_status_inner(Some(codex_dir.display().to_string()), Some(target.clone()))?;
+        session_sync_status_inner(Some(codex_dir.display().to_string()), Some(target_provider))?;
     status.backup_dir = Some(backup_dir.display().to_string());
-    if rollouts.changed_files.is_empty() && sqlite_before.mismatched_threads == 0 {
-        status
-            .warnings
-            .push("没有发现需要修复的会话；已保留一次安全备份。".to_string());
+    if !skipped_rollouts.is_empty() {
+        status.warnings.push(format!(
+            "有 {} 个会话正在使用，已跳过；退出 Codex 后再同步即可。",
+            skipped_rollouts.len()
+        ));
     }
     Ok(SessionSyncResult {
         status,
-        updated_rollouts,
-        updated_threads,
+        updated_rollouts: applied_rollouts.len(),
+        updated_threads: sqlite_updates.total(),
         backup_dir: backup_dir.display().to_string(),
     })
 }
@@ -6527,15 +6949,6 @@ async fn sync_sessions_provider(
     })
     .await
     .map_err(|e| CodexxError::Config(format!("同步会话失败: {e}")))?
-}
-
-#[tauri::command]
-async fn sync_selected_sessions_provider(
-    input: SelectedSessionSyncInput,
-) -> Result<SessionSyncResult> {
-    tauri::async_runtime::spawn_blocking(move || sync_selected_sessions_provider_inner(input))
-        .await
-        .map_err(|e| CodexxError::Config(format!("同步选中会话失败: {e}")))?
 }
 
 #[tauri::command]
@@ -7454,7 +7867,6 @@ pub fn run() {
             get_startup_diagnostics,
             get_session_sync_status,
             sync_sessions_provider,
-            sync_selected_sessions_provider,
             delete_codex_sessions,
             read_ccswitch_official_auth,
             import_ccswitch_codex_providers,
@@ -8861,6 +9273,343 @@ requires_openai_auth = false
             .expect("read sqlite count")
     }
 
+    fn write_rollout_fixture(
+        path: &Path,
+        thread_id: &str,
+        provider: Option<&str>,
+        response_items: &str,
+    ) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create rollout parent");
+        }
+        let provider = provider
+            .map(|value| format!(",\"model_provider\":\"{value}\""))
+            .unwrap_or_default();
+        let content = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\"{provider},\"cwd\":\"/tmp/project\"}}}}\n{response_items}"
+        );
+        write_text(path, &content).expect("write rollout fixture");
+    }
+
+    fn thread_provider(path: &Path, id: &str) -> String {
+        Connection::open(path)
+            .expect("open sqlite for provider")
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("read thread provider")
+    }
+
+    #[test]
+    fn provider_sync_rewrites_every_session_meta_and_preserves_item_ids() {
+        let codex_dir = temp_codex_dir("target-provider-all-meta");
+        let database = codex_dir.join("state_5.sqlite");
+        let thread_id = "019f6000-0000-7000-8000-000000000101";
+        let child_id = "019f6000-0000-7000-8000-000000000102";
+        let rollout = codex_dir.join("sessions/rollout-mixed-meta.jsonl");
+        let content = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"model_provider\":\"openai\",\"cwd\":\"/tmp/project\"}}}}\n\
+             {{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"model_provider\":\"custom\",\"cwd\":\"/tmp/project\"}}}}\n\
+             {{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{child_id}\",\"cwd\":\"/tmp/child\"}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"item_40040926a4b5daaa9118466b\",\"role\":\"assistant\",\"content\":[]}}}}\n"
+        );
+        write_text(&rollout, &content).expect("write mixed rollout");
+        seed_thread_database(&database, &[(thread_id, &rollout)], None);
+
+        let status = session_sync_status_inner(
+            Some(codex_dir.display().to_string()),
+            Some("custom".to_string()),
+        )
+        .expect("scan mixed providers");
+        assert!(status.needs_sync);
+        assert_eq!(status.mismatched_rollouts, 1);
+        assert_eq!(status.mismatched_session_meta, 2);
+        assert!(status.warnings.is_empty());
+
+        let result = sync_sessions_provider_inner(
+            Some(codex_dir.display().to_string()),
+            Some("custom".to_string()),
+        )
+        .expect("sync every session meta");
+        assert_eq!(result.updated_rollouts, 1);
+        assert_eq!(thread_provider(&database, thread_id), "custom");
+
+        let repaired = fs::read_to_string(&rollout).expect("read repaired rollout");
+        assert!(repaired.contains("item_40040926a4b5daaa9118466b"));
+        let providers = repaired
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("session_meta"))
+            .filter_map(|record| {
+                record
+                    .get("payload")
+                    .and_then(Value::as_object)
+                    .and_then(|payload| payload.get("model_provider"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(providers, vec!["custom", "custom", "custom"]);
+        assert!(!result.status.needs_sync);
+
+        let metadata = fs::read_to_string(PathBuf::from(&result.backup_dir).join("metadata.json"))
+            .expect("read backup metadata");
+        assert!(metadata.contains("\"managedBy\": \"Codex-X provider sync v2\""));
+
+        let second = sync_sessions_provider_inner(
+            Some(codex_dir.display().to_string()),
+            Some("custom".to_string()),
+        )
+        .expect("second sync is a no-op");
+        assert_eq!(second.updated_rollouts, 0);
+        assert_eq!(second.updated_threads, 0);
+        assert!(second.backup_dir.is_empty());
+        assert!(second.status.warnings.is_empty());
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn provider_sync_updates_every_session_database_and_index_metadata() {
+        let codex_dir = temp_codex_dir("target-provider-all-dbs");
+        let thread_id = "019f6000-0000-7000-8000-000000000111";
+        let rollout = codex_dir.join("sessions/rollout-metadata.jsonl");
+        write_rollout_fixture(
+            &rollout,
+            thread_id,
+            Some("openai"),
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
+        );
+        let databases = [
+            codex_dir.join("sqlite/state_5.sqlite"),
+            codex_dir.join("state_5.sqlite"),
+        ];
+        for database in &databases {
+            seed_thread_database(database, &[(thread_id, &rollout)], None);
+            let conn = Connection::open(database).expect("open sqlite");
+            conn.execute_batch(
+                "ALTER TABLE threads ADD COLUMN has_user_event INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE threads ADD COLUMN cwd TEXT;
+                 UPDATE threads SET cwd = '/tmp/wrong';",
+            )
+            .expect("seed index drift");
+        }
+
+        assert_eq!(sqlite_session_db_paths(&codex_dir), databases);
+        let status = session_sync_status_inner(
+            Some(codex_dir.display().to_string()),
+            Some("custom".to_string()),
+        )
+        .expect("scan duplicate database rows");
+        assert_eq!(status.sqlite_threads, 1);
+        assert_eq!(status.mismatched_threads, 1);
+        assert_eq!(status.sessions.len(), 1);
+        let result = sync_sessions_provider_inner(
+            Some(codex_dir.display().to_string()),
+            Some("custom".to_string()),
+        )
+        .expect("sync all databases");
+        assert_eq!(result.updated_rollouts, 1);
+        assert_eq!(result.updated_threads, 6);
+        for database in &databases {
+            let repaired = Connection::open(database)
+                .expect("open repaired sqlite")
+                .query_row(
+                    "SELECT model_provider, has_user_event, cwd FROM threads WHERE id = ?1",
+                    [thread_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .expect("read repaired metadata");
+            assert_eq!(
+                repaired,
+                ("custom".to_string(), 1, "/tmp/project".to_string())
+            );
+        }
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn changed_rollout_is_skipped_instead_of_overwritten() {
+        let codex_dir = temp_codex_dir("provider-sync-changed-rollout");
+        let thread_id = "019f6000-0000-7000-8000-000000000115";
+        let rollout = codex_dir.join("sessions/rollout-changed.jsonl");
+        write_rollout_fixture(&rollout, thread_id, Some("openai"), "");
+        let scan = scan_rollouts(&codex_dir, "custom").expect("scan rollout");
+        assert_eq!(scan.changes.len(), 1);
+
+        let appended = format!(
+            "{}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\"}}}}\n",
+            fs::read_to_string(&rollout).expect("read original rollout")
+        );
+        write_text(&rollout, &appended).expect("simulate Codex append");
+        let (applied, skipped) = apply_session_changes(&scan.changes).expect("guard changed file");
+        assert!(applied.is_empty());
+        assert_eq!(skipped, vec![rollout.clone()]);
+        assert_eq!(
+            fs::read_to_string(&rollout).expect("read guarded file"),
+            appended
+        );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn rollback_refuses_to_overwrite_a_file_changed_after_apply() {
+        let codex_dir = temp_codex_dir("provider-sync-rollback-guard");
+        let thread_id = "019f6000-0000-7000-8000-000000000116";
+        let rollout = codex_dir.join("sessions/rollout-rollback-guard.jsonl");
+        write_rollout_fixture(&rollout, thread_id, Some("openai"), "");
+        let scan = scan_rollouts(&codex_dir, "custom").expect("scan rollout");
+        let (applied, skipped) = apply_session_changes(&scan.changes).expect("apply rollout");
+        assert_eq!(applied.len(), 1);
+        assert!(skipped.is_empty());
+
+        let mutation = "Codex appended different content after sync\n";
+        write_text(&rollout, mutation).expect("mutate applied rollout");
+        let error = restore_session_changes(&applied).expect_err("rollback must refuse mutation");
+        assert!(error.to_string().contains("有 1 个会话文件无法安全回滚"));
+        assert_eq!(
+            fs::read_to_string(&rollout).expect("read preserved mutation"),
+            mutation
+        );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn provider_sync_restores_jsonl_when_sqlite_update_fails() {
+        let codex_dir = temp_codex_dir("target-provider-rollback");
+        let database = codex_dir.join("state_5.sqlite");
+        let thread_id = "019f6000-0000-7000-8000-000000000121";
+        let rollout = codex_dir.join("sessions/rollout-rollback.jsonl");
+        write_rollout_fixture(&rollout, thread_id, Some("openai"), "");
+        seed_thread_database(&database, &[(thread_id, &rollout)], None);
+        Connection::open(&database)
+            .expect("open sqlite")
+            .execute_batch(
+                "CREATE TRIGGER reject_provider_update
+                 BEFORE UPDATE OF model_provider ON threads
+                 BEGIN SELECT RAISE(ABORT, 'provider update blocked'); END;",
+            )
+            .expect("install rejecting trigger");
+        let original = fs::read(&rollout).expect("read original rollout");
+
+        let error = sync_sessions_provider_inner(
+            Some(codex_dir.display().to_string()),
+            Some("custom".to_string()),
+        )
+        .expect_err("sqlite update must fail");
+        assert!(error.to_string().contains("provider update blocked"));
+        assert_eq!(
+            fs::read(&rollout).expect("read rolled back rollout"),
+            original
+        );
+        assert_eq!(thread_provider(&database, thread_id), "openai");
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn backup_pruning_only_removes_v2_provider_sync_backups() {
+        let codex_dir = temp_codex_dir("provider-backup-pruning");
+        let root = provider_sync_backup_root(&codex_dir);
+        for index in 0..7 {
+            let historical = root.join(format!("20260714010{index:02}"));
+            fs::create_dir_all(&historical).expect("create historical backup");
+            write_json(
+                &historical.join("metadata.json"),
+                &json!({
+                    "managedBy": "Codex++ provider sync",
+                    "targetProvider": "openai"
+                }),
+            )
+            .expect("write historical metadata");
+
+            let v2 = root.join(format!("20260715010{index:02}"));
+            fs::create_dir_all(&v2).expect("create v2 backup");
+            write_json(
+                &v2.join("metadata.json"),
+                &json!({
+                    "managedBy": "Codex-X provider sync v2",
+                    "targetProvider": "custom"
+                }),
+            )
+            .expect("write v2 metadata");
+        }
+
+        prune_provider_sync_backups(&codex_dir).expect("prune v2 backups");
+        let dirs = fs::read_dir(&root)
+            .expect("read backup root")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dirs.iter()
+                .filter(|name| name.starts_with("20260714"))
+                .count(),
+            7
+        );
+        assert_eq!(
+            dirs.iter()
+                .filter(|name| name.starts_with("20260715"))
+                .count(),
+            5
+        );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn backup_of_external_sqlite_path_never_writes_to_the_source() {
+        let codex_dir = temp_codex_dir("external-sqlite-backup-home");
+        let external_dir = temp_codex_dir("external-sqlite-source");
+        let source = external_dir.join("state_5.sqlite");
+        let backup_dir = codex_dir.join("backups_state/provider-sync/test");
+        seed_thread_database(&source, &[], None);
+        let writer = Connection::open(&source).expect("open external sqlite writer");
+        writer
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("enable WAL mode");
+        writer
+            .execute(
+                "INSERT INTO threads (id, model_provider, rollout_path) VALUES ('wal-thread', 'custom', NULL)",
+                [],
+            )
+            .expect("write WAL-only row");
+        let before = fs::read(&source).expect("read external sqlite before backup");
+
+        backup_sqlite_to_backup(&codex_dir, &backup_dir, &source)
+            .expect("snapshot external sqlite into backup");
+
+        assert!(!before.is_empty());
+        assert_eq!(fs::read(&source).expect("reread external sqlite"), before);
+        let external_root = backup_dir.join("external");
+        let hash_dir = fs::read_dir(&external_root)
+            .expect("read external backup root")
+            .flatten()
+            .next()
+            .expect("external backup hash directory")
+            .path();
+        let copied = hash_dir.join("state_5.sqlite");
+        assert!(!fs::read(&copied)
+            .expect("read external sqlite backup")
+            .is_empty());
+        assert_eq!(sqlite_count(&copied, "SELECT COUNT(*) FROM threads"), 1);
+        drop(writer);
+
+        let _ = fs::remove_dir_all(codex_dir);
+        let _ = fs::remove_dir_all(external_dir);
+    }
+
     #[test]
     fn active_session_database_prefers_current_root_over_legacy_sqlite_copy() {
         let codex_dir = temp_codex_dir("active-session-db");
@@ -8915,7 +9664,7 @@ requires_openai_auth = false
     }
 
     #[test]
-    fn session_previews_hide_subagents_without_deduplicating_root_titles() {
+    fn session_previews_return_subagents_with_explicit_marker() {
         let codex_dir = temp_codex_dir("session-preview-subagents");
         let database = codex_dir.join("state_5.sqlite");
         let root_a = "019f6000-0000-7000-8000-000000000001";
@@ -8969,14 +9718,16 @@ requires_openai_auth = false
         .expect("insert source-marked subagent");
         drop(conn);
 
-        let scan = scan_sqlite(&codex_dir, "openai").expect("scan sqlite");
+        let rollouts = scan_rollouts(&codex_dir, "openai").expect("scan rollouts");
+        let scan = scan_sqlite(&codex_dir, &rollouts, "openai").expect("scan sqlite");
         assert_eq!(scan.sqlite_threads, 5);
         assert_eq!(scan.top_level_threads, 3);
         assert_eq!(scan.subagent_threads, 2);
 
         let (previews, warnings) =
-            list_session_previews(&codex_dir, "openai", 50).expect("list previews");
+            list_session_previews(&codex_dir, &rollouts, "openai", 50).expect("list previews");
         assert!(warnings.is_empty());
+        assert_eq!(previews.iter().filter(|item| item.is_subagent).count(), 2);
         assert_eq!(
             previews
                 .into_iter()
@@ -8985,9 +9736,71 @@ requires_openai_auth = false
             HashSet::from([
                 root_a.to_string(),
                 root_b.to_string(),
-                forked_user.to_string()
+                child.to_string(),
+                orphan_subagent.to_string(),
+                forked_user.to_string(),
             ])
         );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn session_previews_sort_globally_before_deduplicating_database_rows() {
+        let codex_dir = temp_codex_dir("session-preview-database-dedup");
+        let duplicate_id = "019f6000-0000-7000-8000-000000000201";
+        let legacy_only_id = "019f6000-0000-7000-8000-000000000202";
+        let rollout = codex_dir.join("sessions/rollout.jsonl");
+        let current = codex_dir.join("sqlite/state_5.sqlite");
+        let legacy = codex_dir.join("state_5.sqlite");
+        seed_thread_database(&current, &[(duplicate_id, &rollout)], None);
+        seed_thread_database(
+            &legacy,
+            &[(duplicate_id, &rollout), (legacy_only_id, &rollout)],
+            None,
+        );
+        for database in [&current, &legacy] {
+            Connection::open(database)
+                .expect("open thread database")
+                .execute_batch(
+                    "ALTER TABLE threads ADD COLUMN title TEXT;
+                     ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER;",
+                )
+                .expect("add preview columns");
+        }
+        Connection::open(&current)
+            .expect("open current database")
+            .execute(
+                "UPDATE threads SET title = 'new copy', updated_at_ms = 300 WHERE id = ?1",
+                [duplicate_id],
+            )
+            .expect("update current copy");
+        let legacy_conn = Connection::open(&legacy).expect("open legacy database");
+        legacy_conn
+            .execute(
+                "UPDATE threads SET title = 'old copy', updated_at_ms = 100 WHERE id = ?1",
+                [duplicate_id],
+            )
+            .expect("update old copy");
+        legacy_conn
+            .execute(
+                "UPDATE threads SET title = 'legacy only', updated_at_ms = 200 WHERE id = ?1",
+                [legacy_only_id],
+            )
+            .expect("update legacy-only row");
+        drop(legacy_conn);
+
+        let rollouts = scan_rollouts(&codex_dir, "openai").expect("scan rollouts");
+        let sqlite = scan_sqlite(&codex_dir, &rollouts, "openai").expect("scan sqlite");
+        assert_eq!(sqlite.sqlite_threads, 2);
+        assert_eq!(sqlite.top_level_threads, 2);
+        let (previews, warnings) =
+            list_session_previews(&codex_dir, &rollouts, "openai", 50).expect("list previews");
+        assert!(warnings.is_empty());
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0].id, duplicate_id);
+        assert_eq!(previews[0].title, "new copy");
+        assert_eq!(previews[1].id, legacy_only_id);
 
         let _ = fs::remove_dir_all(codex_dir);
     }

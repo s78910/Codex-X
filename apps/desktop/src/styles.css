@@ -1842,6 +1842,56 @@ html, body, #root {
   color: #ffd9a1;
   font-size: 13px;
   line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.session-warning-list p > svg { flex: 0 0 auto; margin-top: 2px; }
+.session-scan-warnings {
+  flex: 0 0 auto;
+  display: block;
+  padding: 0;
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(124, 168, 255, .045);
+  border-color: rgba(124, 168, 255, .11);
+}
+.session-scan-warnings summary {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  color: #91a0bb;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.session-scan-warnings summary::-webkit-details-marker { display: none; }
+.session-scan-warnings summary span {
+  font-size: 13px;
+  font-weight: 800;
+}
+.session-scan-warnings summary small {
+  margin-left: auto;
+  color: #74839a;
+  font-size: 12px;
+}
+.session-scan-warnings p {
+  color: #91a0bb;
+  font-size: 12px;
+}
+.session-warning-items {
+  max-height: min(24vh, 180px);
+  display: grid;
+  gap: 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 0 14px 12px;
+}
+.session-warning-items::-webkit-scrollbar { width: 7px; }
+.session-warning-items::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(148, 163, 184, .22);
 }
 @media (max-width: 1320px) {
   .session-stat-grid {
@@ -1951,7 +2001,7 @@ html, body, #root {
   align-items: center;
   gap: 10px;
   margin: 0 0 10px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
 }
 .session-search {
   flex: 1 1 320px;
@@ -1987,6 +2037,11 @@ html, body, #root {
   font-weight: 700;
 }
 .session-toggle input { accent-color: #12d3ff; }
+.session-internal-toggle {
+  padding-inline: 10px;
+  color: #8796ad;
+  font-size: 12px;
+}
 .session-toolbar .small { height: 38px; padding: 0 12px; }
 .session-delete-trigger {
   flex: 0 0 auto;
