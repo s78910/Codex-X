@@ -27,6 +27,7 @@ mod providers;
 mod remote;
 mod sessions;
 mod skills_mcp;
+mod skins;
 mod sqlite_utils;
 mod state;
 mod toml_utils;
@@ -98,6 +99,10 @@ use skills_mcp::{
 use skills_mcp::{
     normalize_legacy_zip_skill_dirs, read_skill_metadata, sort_managed_mcp_servers,
     sort_managed_skills, ManagedMcpServer, ManagedSkill,
+};
+use skins::{
+    enable_skin_theme_inner, export_skin_theme_inner, get_skin_center_state_inner,
+    import_skin_theme_zip_inner, SkinActionResult, SkinCenterState, SkinExportResult,
 };
 #[cfg(test)]
 use state::active_saved_provider_id_from_config;
@@ -468,6 +473,34 @@ async fn install_skill_zip(
     })
     .await
     .map_err(|e| CodexxError::Config(format!("ZIP 安装 Skill 失败: {e}")))?
+}
+
+#[tauri::command]
+async fn get_skin_center_state() -> Result<SkinCenterState> {
+    tauri::async_runtime::spawn_blocking(get_skin_center_state_inner)
+        .await
+        .map_err(|e| CodexxError::Config(format!("读取皮肤中心失败: {e}")))?
+}
+
+#[tauri::command]
+async fn enable_skin_theme(id: String) -> Result<SkinActionResult> {
+    tauri::async_runtime::spawn_blocking(move || enable_skin_theme_inner(id))
+        .await
+        .map_err(|e| CodexxError::Config(format!("启用皮肤失败: {e}")))?
+}
+
+#[tauri::command]
+async fn import_skin_theme_zip(file_name: String, bytes: Vec<u8>) -> Result<SkinActionResult> {
+    tauri::async_runtime::spawn_blocking(move || import_skin_theme_zip_inner(file_name, bytes))
+        .await
+        .map_err(|e| CodexxError::Config(format!("导入皮肤失败: {e}")))?
+}
+
+#[tauri::command]
+async fn export_skin_theme(id: String) -> Result<SkinExportResult> {
+    tauri::async_runtime::spawn_blocking(move || export_skin_theme_inner(id))
+        .await
+        .map_err(|e| CodexxError::Config(format!("导出皮肤失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1091,6 +1124,10 @@ pub fn run() {
             toggle_codex_skill,
             toggle_codex_mcp,
             install_skill_zip,
+            get_skin_center_state,
+            enable_skin_theme,
+            import_skin_theme_zip,
+            export_skin_theme,
             check_skill_updates,
             get_startup_diagnostics,
             get_session_sync_status,

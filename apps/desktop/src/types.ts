@@ -223,3 +223,45 @@ export type StartupDiagnostics = {
   summary: string;
   items: DiagnosticItem[];
 };
+
+export type SkinThemeColors = {
+  background: string;
+  panel: string;
+  panelAlt: string;
+  accent: string;
+  accentAlt: string;
+  secondary: string;
+  highlight: string;
+  text: string;
+  muted: string;
+  line: string;
+};
+
+export type SkinThemeSummary = {
+  id: string;
+  name: string;
+  tagline: string;
+  quote: string;
+  image: string;
+  source: "builtin" | "imported" | string;
+  enabled: boolean;
+  directory: string;
+  colors: SkinThemeColors;
+};
+
+export type SkinCenterState = {
+  skinsDir: string;
+  currentThemeId?: string | null;
+  currentThemePath?: string | null;
+  themes: SkinThemeSummary[];
+};
+
+export type SkinActionResult = {
+  message: string;
+  state: SkinCenterState;
+};
+
+export type SkinExportResult = {
+  path: string;
+  message: string;
+};

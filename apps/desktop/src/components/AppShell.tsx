@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   LoaderCircle,
   Moon,
+  Palette,
   RotateCcw,
   Settings,
   Sparkles,
@@ -28,6 +29,7 @@ export type AppTab =
   | "provider"
   | "sessions"
   | "skillsMcp"
+  | "skins"
   | "instruction"
   | "toml"
   | "settings"
@@ -44,6 +46,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { id: "provider", icon: Zap, label: { zh: "供应商", en: "Providers" } },
   { id: "sessions", icon: History, label: { zh: "会话管理", en: "Sessions" } },
   { id: "skillsMcp", icon: Blocks, label: { zh: "技能和MCP", en: "Skills & MCP" } },
+  { id: "skins", icon: Palette, label: { zh: "皮肤中心", en: "Skins" } },
   { id: "instruction", icon: Sparkles, label: { zh: "指令提示词", en: "Prompts" } },
   { id: "toml", icon: FileCode2, label: { zh: "TOML", en: "TOML" } },
   { id: "settings", icon: Settings, label: { zh: "设置", en: "Settings" } },
