@@ -87,6 +87,7 @@ def main() -> None:
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--rewrite-download-urls", action="store_true")
+    parser.add_argument("--require-signature-assets", action="store_true")
     args = parser.parse_args()
 
     manifest = load_json(args.manifest)
@@ -144,12 +145,18 @@ def main() -> None:
         asset_name = asset["name"]
         if not asset_name.endswith(suffix):
             fail(f"{platform} points to {asset_name!r}, expected a {suffix} updater")
-        if f"{asset_name}.sig" not in asset_names:
+        if args.require_signature_assets and f"{asset_name}.sig" not in asset_names:
             fail(f"signature asset is missing for {asset_name}")
 
+    signature_status = (
+        "signature assets required"
+        if args.require_signature_assets
+        else "signature assets optional"
+    )
     print(
         f"Validated updater {args.version}: "
-        f"{len(REQUIRED_PLATFORMS)} platform installers and signatures are complete."
+        f"{len(REQUIRED_PLATFORMS)} platform installers are complete; "
+        f"{signature_status}."
     )
 
 

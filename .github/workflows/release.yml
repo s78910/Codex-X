@@ -404,8 +404,21 @@ jobs:
             --manifest latest.json \
             --assets release-assets.json \
             --version "$VERSION" \
-            --rewrite-download-urls
+            --rewrite-download-urls \
+            --require-signature-assets
           gh release upload "$RELEASE_TAG" latest.json --clobber
+
+      - name: Remove public signature assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | select(.name | endswith(".sig")) | .id' \
+            | while read -r asset_id; do
+                [ -z "$asset_id" ] || gh api --method DELETE "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+              done
 
       - name: Publish the verified release
         env:
