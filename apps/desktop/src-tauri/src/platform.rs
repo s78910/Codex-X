@@ -6,6 +6,12 @@ use std::process::{Command, Output};
 #[cfg(target_os = "windows")]
 use std::env;
 
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_CODEX_PACKAGE_IDENTITIES: &[&str] =
+    &["OpenAI.Codex", "OpenAI.CodexBeta", "OpenAI.ChatGPT-Desktop"];
+#[cfg(target_os = "windows")]
+const WINDOWS_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe", "codex.exe"];
+
 fn version_line(stdout: &str, stderr: &str, success: bool) -> Option<String> {
     let lines = stdout.lines().chain(stderr.lines()).map(str::trim);
     let preferred = lines.clone().find(|line| {
@@ -98,6 +104,62 @@ fn push_candidate(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<String>, pat
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn numeric_version(value: &str) -> Option<Vec<u32>> {
+    let parts = value
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    (parts.len() >= 2).then_some(parts)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_package_version(package_name: &str) -> Option<(Vec<u32>, String)> {
+    for identity in WINDOWS_CODEX_PACKAGE_IDENTITIES {
+        let prefix_len = identity.len();
+        if !package_name
+            .get(..prefix_len)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(identity))
+            || package_name.as_bytes().get(prefix_len) != Some(&b'_')
+        {
+            continue;
+        }
+        let version = package_name.get(prefix_len + 1..)?.split('_').next()?;
+        return Some((numeric_version(version)?, version.to_string()));
+    }
+    None
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn latest_windows_package_version<'a>(
+    package_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    package_names
+        .into_iter()
+        .filter_map(windows_package_version)
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, version)| version)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_store_app_version_from_roots(roots: &[PathBuf]) -> Option<String> {
+    let mut package_names = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        package_names.extend(entries.flatten().filter_map(|entry| {
+            entry
+                .path()
+                .is_dir()
+                .then(|| entry.file_name().to_string_lossy().to_string())
+        }));
+    }
+    latest_windows_package_version(package_names.iter().map(String::as_str))
+        .map(|version| format!("Codex app {version}"))
+}
+
 fn collect_named_files(root: &Path, names: &[&str], depth: usize, output: &mut Vec<PathBuf>) {
     if depth == 0 || !root.is_dir() {
         return;
@@ -170,8 +232,13 @@ fn platform_candidates(home: &Path) -> Vec<PathBuf> {
         PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
         home.join("Applications/ChatGPT.app/Contents/Resources/codex"),
         PathBuf::from("/Applications/Codex.app/Contents/Resources/codex"),
+        home.join("Applications/Codex.app/Contents/Resources/codex"),
         PathBuf::from("/Applications/OpenAI Codex.app/Contents/Resources/codex"),
+        home.join("Applications/OpenAI Codex.app/Contents/Resources/codex"),
+        PathBuf::from("/Applications/OpenAI.Codex.app/Contents/Resources/codex"),
+        home.join("Applications/OpenAI.Codex.app/Contents/Resources/codex"),
         PathBuf::from("/Applications/ChatGPT Codex.app/Contents/Resources/codex"),
+        home.join("Applications/ChatGPT Codex.app/Contents/Resources/codex"),
         PathBuf::from("/opt/homebrew/bin/codex"),
         PathBuf::from("/usr/local/bin/codex"),
         home.join(".local/bin/codex"),
@@ -205,7 +272,9 @@ fn platform_candidates(home: &Path) -> Vec<PathBuf> {
         for root in [
             localappdata.join("Programs/ChatGPT"),
             localappdata.join("Programs/Codex"),
+            localappdata.join("Programs/OpenAI/Codex"),
             localappdata.join("OpenAI/ChatGPT"),
+            localappdata.join("OpenAI/Codex"),
         ] {
             collect_named_files(&root, &["codex.exe", "codex.cmd"], 7, &mut candidates);
         }
@@ -271,35 +340,117 @@ fn windows_where_candidates() -> Vec<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn macos_app_version() -> Option<String> {
-    for app in [
-        "/Applications/ChatGPT.app",
-        "/Applications/Codex.app",
-        "/Applications/OpenAI Codex.app",
-        "/Applications/ChatGPT Codex.app",
-    ] {
-        let Some(output) =
-            run_program(Path::new("mdls"), &["-name", "kMDItemVersion", "-raw", app])
-        else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() && version != "(null)" {
-            let app_name = if app.ends_with("ChatGPT.app") {
+    let home = dirs::home_dir().unwrap_or_default();
+    for root in [PathBuf::from("/Applications"), home.join("Applications")] {
+        for name in [
+            "Codex.app",
+            "OpenAI Codex.app",
+            "OpenAI.Codex.app",
+            "ChatGPT Codex.app",
+            "ChatGPT.app",
+        ] {
+            let app = root.join(name);
+            if !app.is_dir() {
+                continue;
+            }
+            let app_name = if name == "ChatGPT.app" {
                 "ChatGPT app"
             } else {
                 "Codex app"
             };
-            return Some(format!("{app_name} {version}"));
+            if let Some(version) = macos_info_plist_version(&app).or_else(|| {
+                let app = app.to_str()?;
+                let output =
+                    run_program(Path::new("mdls"), &["-name", "kMDItemVersion", "-raw", app])?;
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            }) {
+                if !version.is_empty() && version != "(null)" {
+                    return Some(format!("{app_name} {version}"));
+                }
+            }
+            return Some(format!("{app_name} installed"));
         }
     }
     None
 }
 
+#[cfg(target_os = "macos")]
+fn macos_info_plist_version(app: &Path) -> Option<String> {
+    let plist = fs::read_to_string(app.join("Contents/Info.plist")).ok()?;
+    plist_string_value(&plist, "CFBundleShortVersionString")
+        .or_else(|| plist_string_value(&plist, "CFBundleVersion"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn plist_string_value(plist: &str, key: &str) -> Option<String> {
+    let (_, after_key) = plist.split_once(&format!("<key>{key}</key>"))?;
+    let (_, after_open) = after_key.split_once("<string>")?;
+    let (value, _) = after_open.split_once("</string>")?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn macos_app_version() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_app_version() -> Option<String> {
+    let mut roots = Vec::new();
+    for variable in ["ProgramFiles", "ProgramW6432"] {
+        if let Ok(program_files) = env::var(variable) {
+            roots.push(PathBuf::from(program_files).join("WindowsApps"));
+        }
+    }
+    roots.push(PathBuf::from(r"C:\Program Files\WindowsApps"));
+    roots.sort();
+    roots.dedup();
+    if let Some(version) = windows_store_app_version_from_roots(&roots) {
+        return Some(version);
+    }
+
+    let script = "Get-AppxPackage | Where-Object { $_.Name -in @('OpenAI.Codex','OpenAI.CodexBeta','OpenAI.ChatGPT-Desktop') } | ForEach-Object { $_.Version.ToString() }";
+    if let Some(output) = run_program(
+        Path::new("powershell.exe"),
+        &["-NoProfile", "-NonInteractive", "-Command", script],
+    ) {
+        if output.status.success() {
+            let versions = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter_map(|version| {
+                    numeric_version(version).map(|parsed| (parsed, version.to_string()))
+                })
+                .max_by(|left, right| left.0.cmp(&right.0));
+            if let Some((_, version)) = versions {
+                return Some(format!("Codex app {version}"));
+            }
+        }
+    }
+
+    let local_appdata = env::var("LOCALAPPDATA").ok().map(PathBuf::from)?;
+    for directory in [
+        local_appdata.join("OpenAI/Codex/bin"),
+        local_appdata.join("OpenAI/Codex"),
+        local_appdata.join("Programs/OpenAI/Codex"),
+        local_appdata.join("Programs/Codex"),
+    ] {
+        if WINDOWS_CODEX_EXECUTABLES.iter().any(|name| {
+            directory.join(name).is_file() || directory.join("app").join(name).is_file()
+        }) {
+            return Some("Codex app installed".to_string());
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_app_version() -> Option<String> {
     None
 }
 
@@ -328,12 +479,12 @@ pub fn detect_codex_version() -> Option<String> {
             }
         }
     }
-    macos_app_version()
+    macos_app_version().or_else(windows_app_version)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::version_line;
+    use super::{latest_windows_package_version, plist_string_value, version_line};
 
     #[test]
     fn version_parser_prefers_codex_line_over_warning() {
@@ -361,6 +512,30 @@ mod tests {
         assert_eq!(
             version_line("", "error: command not found 127\n", false),
             None
+        );
+    }
+
+    #[test]
+    fn windows_package_detection_accepts_supported_codex_packages() {
+        assert_eq!(
+            latest_windows_package_version([
+                "OpenAI.Codex_1.2.3.4_x64__publisher",
+                "OpenAI.CodexBeta_1.3.0.0_x64__publisher",
+                "Other.App_99.0.0.0_x64__publisher",
+            ]),
+            Some("1.3.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn plist_parser_reads_codex_bundle_version() {
+        let plist = r#"<plist><dict>
+<key>CFBundleShortVersionString</key>
+<string>1.2026.204</string>
+</dict></plist>"#;
+        assert_eq!(
+            plist_string_value(plist, "CFBundleShortVersionString").as_deref(),
+            Some("1.2026.204")
         );
     }
 }

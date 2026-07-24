@@ -24,11 +24,16 @@
   color: var(--cx-tool-text);
 }
 
-.cx-skills-page,
-.cx-prompts-page--list {
+.cx-skills-page {
   height: 100%;
   flex: 1 1 auto;
   overflow: hidden;
+}
+
+.cx-prompts-page--list {
+  min-height: 100%;
+  flex: 0 0 auto;
+  overflow: visible;
 }
 
 .cx-prompts-page--form {
@@ -1074,7 +1079,7 @@
   min-width: 0;
   min-height: 0;
   display: flex;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   flex-direction: column;
   gap: 10px;
 }
@@ -1082,12 +1087,12 @@
 .cx-prompts-list {
   min-width: 0;
   min-height: 0;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   align-content: start;
   gap: 16px;
-  overflow-y: auto;
+  overflow: visible;
   padding: 0 8px 32px 0;
   scrollbar-gutter: stable;
 }

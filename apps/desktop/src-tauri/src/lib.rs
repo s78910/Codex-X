@@ -27,6 +27,8 @@ mod providers;
 mod remote;
 mod sessions;
 mod skills_mcp;
+mod skin_presets;
+mod skin_runtime;
 mod skins;
 mod sqlite_utils;
 mod state;
@@ -101,8 +103,10 @@ use skills_mcp::{
     sort_managed_skills, ManagedMcpServer, ManagedSkill,
 };
 use skins::{
-    enable_skin_theme_inner, export_skin_theme_inner, get_skin_center_state_inner,
-    import_skin_theme_zip_inner, SkinActionResult, SkinCenterState, SkinExportResult,
+    create_skin_theme_from_image_inner, enable_skin_theme_inner, export_skin_theme_inner,
+    get_skin_center_state_inner, import_skin_theme_zip_inner, pause_skin_theme_inner,
+    restore_skin_theme_inner, update_skin_theme_settings_inner, SkinActionResult, SkinCenterState,
+    SkinExportResult,
 };
 #[cfg(test)]
 use state::active_saved_provider_id_from_config;
@@ -483,8 +487,8 @@ async fn get_skin_center_state() -> Result<SkinCenterState> {
 }
 
 #[tauri::command]
-async fn enable_skin_theme(id: String) -> Result<SkinActionResult> {
-    tauri::async_runtime::spawn_blocking(move || enable_skin_theme_inner(id))
+async fn enable_skin_theme(id: String, restart_existing: bool) -> Result<SkinActionResult> {
+    tauri::async_runtime::spawn_blocking(move || enable_skin_theme_inner(id, restart_existing))
         .await
         .map_err(|e| CodexxError::Config(format!("启用皮肤失败: {e}")))?
 }
@@ -497,10 +501,50 @@ async fn import_skin_theme_zip(file_name: String, bytes: Vec<u8>) -> Result<Skin
 }
 
 #[tauri::command]
-async fn export_skin_theme(id: String) -> Result<SkinExportResult> {
-    tauri::async_runtime::spawn_blocking(move || export_skin_theme_inner(id))
+async fn create_skin_theme_from_image(
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<SkinActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        create_skin_theme_from_image_inner(file_name, bytes)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("从图片创建皮肤失败: {e}")))?
+}
+
+#[tauri::command]
+async fn update_skin_theme_settings(
+    id: String,
+    name: String,
+    tagline: String,
+    surface_opacity: f64,
+) -> Result<SkinActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        update_skin_theme_settings_inner(id, name, tagline, surface_opacity)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("保存皮肤设置失败: {e}")))?
+}
+
+#[tauri::command]
+async fn export_skin_theme(id: String, destination_path: String) -> Result<SkinExportResult> {
+    tauri::async_runtime::spawn_blocking(move || export_skin_theme_inner(id, destination_path))
         .await
         .map_err(|e| CodexxError::Config(format!("导出皮肤失败: {e}")))?
+}
+
+#[tauri::command]
+async fn pause_skin_theme() -> Result<SkinActionResult> {
+    tauri::async_runtime::spawn_blocking(pause_skin_theme_inner)
+        .await
+        .map_err(|e| CodexxError::Config(format!("暂停皮肤失败: {e}")))?
+}
+
+#[tauri::command]
+async fn restore_skin_theme(restart_existing: bool) -> Result<SkinActionResult> {
+    tauri::async_runtime::spawn_blocking(move || restore_skin_theme_inner(restart_existing))
+        .await
+        .map_err(|e| CodexxError::Config(format!("恢复官方外观失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1113,6 +1157,7 @@ fn open_url(url: String) -> std::result::Result<(), String> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
@@ -1127,7 +1172,11 @@ pub fn run() {
             get_skin_center_state,
             enable_skin_theme,
             import_skin_theme_zip,
+            create_skin_theme_from_image,
+            update_skin_theme_settings,
             export_skin_theme,
+            pause_skin_theme,
+            restore_skin_theme,
             check_skill_updates,
             get_startup_diagnostics,
             get_session_sync_status,

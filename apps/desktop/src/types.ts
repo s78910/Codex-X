@@ -243,10 +243,28 @@ export type SkinThemeSummary = {
   tagline: string;
   quote: string;
   image: string;
+  imagePath: string;
   source: "builtin" | "imported" | string;
   enabled: boolean;
   directory: string;
+  adaptive: boolean;
+  surfaceOpacity: number;
+  art: {
+    focusX?: number | null;
+    focusY?: number | null;
+    safeArea?: "auto" | "left" | "right" | "center" | "none" | string | null;
+    taskMode?: "auto" | "ambient" | "banner" | "off" | string | null;
+  };
   colors: SkinThemeColors;
+};
+
+export type SkinRuntimeStatus = {
+  supported: boolean;
+  active: boolean;
+  phase: "unsupported" | "inactive" | "active" | "paused" | "stale" | "unavailable" | "error" | string;
+  port?: number | null;
+  themeId?: string | null;
+  message: string;
 };
 
 export type SkinCenterState = {
@@ -254,11 +272,13 @@ export type SkinCenterState = {
   currentThemeId?: string | null;
   currentThemePath?: string | null;
   themes: SkinThemeSummary[];
+  runtime: SkinRuntimeStatus;
 };
 
 export type SkinActionResult = {
   message: string;
   state: SkinCenterState;
+  restartRequired: boolean;
 };
 
 export type SkinExportResult = {

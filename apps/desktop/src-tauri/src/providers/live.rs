@@ -13,7 +13,7 @@ use crate::state::{build_state, ActionResult};
 use crate::toml_utils::ensure_table;
 use crate::{auth_path, config_path, resolve_codex_dir, string_value};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use toml_edit::{value, DocumentMut};
@@ -307,7 +307,6 @@ where
     ensure_directory(&codex_dir)?;
     pre_persist(&codex_dir)?;
     let cfg = config_path(&codex_dir);
-    let auth = auth_path(&codex_dir);
     let backup_id = create_backup(&codex_dir, "save-provider-toml")?;
 
     let config_text = input.config_text.trim_end().to_string();
@@ -325,21 +324,6 @@ where
         set_provider_bearer_token(&mut doc, api_key);
     }
     write_text(&cfg, &(doc.to_string().trim_end().to_string() + "\n"))?;
-
-    if let Some(api_key) = api_key {
-        let mut auth_value = if auth.exists() {
-            let text = fs::read_to_string(&auth).map_err(|e| io_err(&auth, e))?;
-            serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}))
-        } else {
-            json!({})
-        };
-        if !auth_value.is_object() {
-            auth_value = json!({});
-        }
-        auth_value["OPENAI_API_KEY"] = Value::String(api_key);
-        auth_value["auth_mode"] = Value::String("apikey".to_string());
-        write_json(&auth, &auth_value)?;
-    }
 
     let state = build_state(codex_dir)?;
     Ok(ActionResult {
@@ -365,7 +349,6 @@ where
     ensure_directory(&codex_dir)?;
     pre_persist(&codex_dir)?;
     let cfg = config_path(&codex_dir);
-    let auth = auth_path(&codex_dir);
     let backup_id = create_backup(&codex_dir, "switch-provider")?;
 
     let provider_name = input.provider_name.trim();
@@ -413,14 +396,6 @@ where
         set_provider_bearer_token(&mut doc, api_key);
     }
     write_text(&cfg, &doc.to_string())?;
-
-    if let Some(api_key) = api_key {
-        let auth_value = json!({
-            "OPENAI_API_KEY": api_key,
-            "auth_mode": "apikey",
-        });
-        write_json(&auth, &auth_value)?;
-    }
 
     let state = build_state(codex_dir)?;
     Ok(ActionResult {

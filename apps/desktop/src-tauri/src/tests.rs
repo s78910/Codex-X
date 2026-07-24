@@ -1107,8 +1107,19 @@ description: Keep long investigations aligned.
 }
 
 #[test]
-fn switch_provider_writes_scoped_bearer_and_api_key_auth_mode() {
+fn switch_provider_writes_scoped_bearer_without_overwriting_official_auth() {
     let codex_dir = temp_codex_dir("switch-provider");
+    let official_auth = json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": "official-access-token",
+            "refresh_token": "official-refresh-token"
+        },
+        "last_refresh": "2026-07-24T00:00:00Z"
+    });
+    write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
+    let auth_before = fs::read(auth_path(&codex_dir)).expect("read official auth before switch");
+
     let result = switch_provider_inner(ProviderInput {
         config_dir: Some(codex_dir.display().to_string()),
         _provider_id: Some("magicai".to_string()),
@@ -1139,16 +1150,8 @@ fn switch_provider_writes_scoped_bearer_and_api_key_auth_mode() {
     );
     assert!(config_doc.get("experimental_bearer_token").is_none());
 
-    let auth_text = fs::read_to_string(auth_path(&codex_dir)).expect("read auth");
-    let auth: Value = serde_json::from_str(&auth_text).expect("parse auth");
-    assert_eq!(
-        auth.get("OPENAI_API_KEY").and_then(Value::as_str),
-        Some("sk-test")
-    );
-    assert_eq!(
-        auth.get("auth_mode").and_then(Value::as_str),
-        Some("apikey")
-    );
+    let auth_after = fs::read(auth_path(&codex_dir)).expect("read official auth after switch");
+    assert_eq!(auth_after, auth_before);
 
     let _ = fs::remove_dir_all(codex_dir);
 }
@@ -1170,7 +1173,14 @@ experimental_bearer_token = "sk-a-scoped"
 "#,
     )
     .expect("write provider A config");
-    write_text(&auth_path(&codex_dir), "{ invalid auth").expect("write malformed provider A auth");
+    write_json(
+        &auth_path(&codex_dir),
+        &json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "official-access-token"}
+        }),
+    )
+    .expect("write official auth");
 
     let persisted = std::cell::RefCell::new(None);
     let result = switch_provider_with_pre_persist(
@@ -1431,6 +1441,13 @@ requires_openai_auth = true
 #[test]
 fn save_provider_toml_config_writes_provider_scoped_bearer_token() {
     let codex_dir = temp_codex_dir("save-provider-toml-token");
+    let official_auth = json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"access_token": "official-access-token"}
+    });
+    write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
+    let auth_before = fs::read(auth_path(&codex_dir)).expect("read auth before save");
+
     let result = save_provider_toml_config_inner(ProviderTomlInput {
         config_dir: Some(codex_dir.display().to_string()),
         config_text: r#"model_provider = "proxy"
@@ -1451,6 +1468,8 @@ requires_openai_auth = false
     let config_text = fs::read_to_string(config_path(&codex_dir)).expect("read config");
     assert!(config_text.contains("[model_providers.proxy]"));
     assert!(config_text.contains("experimental_bearer_token = \"sk-provider-table\""));
+    let auth_after = fs::read(auth_path(&codex_dir)).expect("read auth after save");
+    assert_eq!(auth_after, auth_before);
 
     let _ = fs::remove_dir_all(codex_dir);
 }

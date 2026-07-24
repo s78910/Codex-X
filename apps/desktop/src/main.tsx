@@ -14,10 +14,16 @@ import { SkillsMcpPage } from "./pages/SkillsMcpPage";
 import { SkinsPage } from "./pages/SkinsPage";
 import { ProvidersPage, type ProviderCopy, type ProviderRow } from "./pages/ProvidersPage";
 import { AppShell, type AppTab, type AppTheme } from "./components/AppShell";
-import { AppToast, StartupWizardDialog, UpdateDialog } from "./components/AppDialogs";
+import {
+  AppToast,
+  SkinRestartDialog,
+  StartupWizardDialog,
+  UpdateDialog,
+} from "./components/AppDialogs";
 import { PageTransition } from "./components/PageTransition";
 import { cx } from "./components/ui";
 import { appUpdater, useAppUpdater } from "./appUpdater";
+import { useSkinCenter } from "./hooks/useSkinCenter";
 import type {
   AboutInfo,
   ActionResult,
@@ -38,9 +44,6 @@ import type {
   SavedProvider,
   SessionDeleteResult,
   SessionSyncResult,
-  SkinActionResult,
-  SkinCenterState,
-  SkinExportResult,
   SkillsMcpActionResult,
   SkillsMcpImportPreview,
   SkillsMcpState,
@@ -751,7 +754,6 @@ function App() {
   const [skillsMcpState, setSkillsMcpState] = React.useState<SkillsMcpState | null>(null);
   const [skillsMcpImportPreview, setSkillsMcpImportPreview] = React.useState<SkillsMcpImportPreview | null>(null);
   const [skillsMcpImportOpen, setSkillsMcpImportOpen] = React.useState(false);
-  const [skinCenterState, setSkinCenterState] = React.useState<SkinCenterState | null>(null);
   const [startupDiagnostics, setStartupDiagnostics] = React.useState<StartupDiagnostics | null>(null);
   const [startupWizardOpen, setStartupWizardOpen] = React.useState(() => localStorage.getItem(STARTUP_WIZARD_SEEN_KEY) !== "1");
   const [startupClosing, setStartupClosing] = React.useState(false);
@@ -784,7 +786,6 @@ function App() {
   const autoUpdateCheckedRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
   const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
-  const skinZipImportRef = React.useRef<HTMLInputElement | null>(null);
   const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerModelsRequestRef = React.useRef(0);
   const promptModeHelpRef = React.useRef<HTMLDivElement | null>(null);
@@ -794,8 +795,29 @@ function App() {
   const promptCatalogReadyRef = React.useRef(false);
   const promptModeSyncedRef = React.useRef("");
   const skillsMcpLoadedRef = React.useRef(false);
-  const skinCenterLoadedRef = React.useRef(false);
   const themeTransitionTimerRef = React.useRef<number | null>(null);
+  const {
+    state: skinCenterState,
+    restartRequest: skinRestartRequest,
+    zipInputRef: skinZipImportRef,
+    imageInputRef: skinImageInputRef,
+    refresh: refreshSkinCenter,
+    importZip: importSkinThemeZip,
+    createFromImage: createSkinThemeFromImage,
+    updateSettings: updateSkinThemeSettings,
+    apply: enableSkinTheme,
+    pause: pauseSkinTheme,
+    confirmRestart: confirmSkinRestart,
+    closeRestart: closeSkinRestart,
+    exportTheme: exportSkinTheme,
+  } = useSkinCenter({
+    lang,
+    tab,
+    ready: Boolean(state),
+    setActionBusy,
+    setError,
+    setToast,
+  });
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const activeBuiltinTemplateId = state?.instructionTemplateKey?.startsWith("builtin:")
@@ -1651,79 +1673,6 @@ function App() {
     void loadSkillsMcp();
   }, [tab, loadSkillsMcp]);
 
-  const loadSkinCenter = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
-    if (!quiet) {
-      setActionBusy("loadSkins");
-      setError("");
-    }
-    try {
-      const result = await invoke<SkinCenterState>("get_skin_center_state");
-      setSkinCenterState(result);
-    } catch (e) {
-      if (!quiet) setError(String(e));
-    } finally {
-      if (!quiet) setActionBusy("");
-    }
-  }, []);
-
-  React.useEffect(() => {
-    if (tab !== "skins" || skinCenterLoadedRef.current) return;
-    skinCenterLoadedRef.current = true;
-    void loadSkinCenter();
-  }, [tab, loadSkinCenter]);
-
-  const importSkinThemeZip = async (file?: File | null) => {
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".zip")) {
-      setError(lang === "zh" ? "请选择 .zip 主题包" : "Please choose a .zip theme pack");
-      return;
-    }
-    if (file.size > 24 * 1024 * 1024) {
-      setError(lang === "zh" ? "主题包不能超过 24MB" : "Theme ZIP must be smaller than 24MB");
-      return;
-    }
-    setActionBusy("importSkinZip");
-    setError("");
-    try {
-      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-      const result = await invoke<SkinActionResult>("import_skin_theme_zip", { fileName: file.name, bytes });
-      setSkinCenterState(result.state);
-      setToast(result.message);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy("");
-      if (skinZipImportRef.current) skinZipImportRef.current.value = "";
-    }
-  };
-
-  const enableSkinTheme = async (id: string) => {
-    setActionBusy(`skin:${id}`);
-    setError("");
-    try {
-      const result = await invoke<SkinActionResult>("enable_skin_theme", { id });
-      setSkinCenterState(result.state);
-      setToast(result.message);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy("");
-    }
-  };
-
-  const exportSkinTheme = async (id: string) => {
-    setActionBusy(`skinExport:${id}`);
-    setError("");
-    try {
-      const result = await invoke<SkinExportResult>("export_skin_theme", { id });
-      setToast(result.message || (lang === "zh" ? `主题包已导出：${result.path}` : `Theme exported: ${result.path}`));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy("");
-    }
-  };
-
   const openImportExistingSkillsMcpPreview = async () => {
     setActionBusy("previewExistingSkillsMcp");
     setError("");
@@ -2032,8 +1981,6 @@ function App() {
         (
           (tab === "provider" && providerMode === "list")
           || tab === "skillsMcp"
-          || tab === "skins"
-          || (tab === "instruction" && instructionMode === "list")
         ) && "cx-app-content--fixed",
         skillsMcpImportOpen && Boolean(skillsMcpImportPreview) && "cx-app-content--modal-locked",
       )}
@@ -2060,6 +2007,14 @@ function App() {
           setUpdatePromptOpen(false);
           openExternalUrl(releaseInfo.htmlUrl);
         }}
+      />
+      <SkinRestartDialog
+        open={Boolean(skinRestartRequest)}
+        lang={lang}
+        themeName={skinRestartRequest?.themeName}
+        busy={actionBusy.startsWith("skin:")}
+        onClose={closeSkinRestart}
+        onConfirm={confirmSkinRestart}
       />
       <StartupWizardDialog
         open={startupWizardOpen}
@@ -2278,16 +2233,20 @@ function App() {
             )}
 
             {state && (tab === "skins" || visitedTabs.has("skins")) && (
-              <div className={tab !== "skins" ? "page-pane-hidden" : undefined}>
+              <div className={cx("cx-skins-pane", tab !== "skins" && "page-pane-hidden")}>
                 <SkinsPage
                   lang={lang}
                   state={skinCenterState}
                   actionBusy={actionBusy}
                   zipInputRef={skinZipImportRef}
-                  onLoad={loadSkinCenter}
+                  imageInputRef={skinImageInputRef}
+                  onLoad={refreshSkinCenter}
                   onImportZip={importSkinThemeZip}
+                  onCreateFromImage={createSkinThemeFromImage}
+                  onUpdateThemeSettings={updateSkinThemeSettings}
                   onEnableTheme={enableSkinTheme}
                   onExportTheme={exportSkinTheme}
+                  onPauseTheme={pauseSkinTheme}
                 />
               </div>
             )}

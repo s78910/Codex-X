@@ -2,7 +2,7 @@ import * as React from "react";
 
 import type { Lang } from "./types";
 
-const STORAGE_KEY = "codexx.promptCategories.v1";
+const PROMPT_STORAGE_KEY = "codexx.promptCategories.v1";
 const STATE_VERSION = 1 as const;
 export const PROMPT_CATEGORY_NAME_MAX_LENGTH = 40;
 
@@ -19,7 +19,12 @@ type PromptCategoryState = {
   assignments: Record<string, string>;
 };
 
-function defaultCategories(lang: Lang): PromptCategory[] {
+export type ManagedCategoryOptions = {
+  storageKey: string;
+  defaultCategories: (lang: Lang) => PromptCategory[];
+};
+
+function defaultPromptCategories(lang: Lang): PromptCategory[] {
   return lang === "zh"
     ? [
         { id: "security-reverse", name: "破甲/逆向" },
@@ -33,8 +38,13 @@ function defaultCategories(lang: Lang): PromptCategory[] {
       ];
 }
 
-function initialState(lang: Lang): PromptCategoryState {
-  const categories = defaultCategories(lang);
+const PROMPT_CATEGORY_OPTIONS: ManagedCategoryOptions = {
+  storageKey: PROMPT_STORAGE_KEY,
+  defaultCategories: defaultPromptCategories,
+};
+
+function initialState(lang: Lang, options: ManagedCategoryOptions): PromptCategoryState {
+  const categories = options.defaultCategories(lang);
   return {
     version: STATE_VERSION,
     categories,
@@ -48,8 +58,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function sanitizePromptCategoryState(value: unknown, lang: Lang): PromptCategoryState {
-  const fallback = initialState(lang);
+export function sanitizePromptCategoryState(
+  value: unknown,
+  lang: Lang,
+  options: ManagedCategoryOptions = PROMPT_CATEGORY_OPTIONS,
+): PromptCategoryState {
+  const fallback = initialState(lang, options);
   if (!isRecord(value) || value.version !== STATE_VERSION || !Array.isArray(value.categories)) {
     return fallback;
   }
@@ -91,19 +105,19 @@ export function sanitizePromptCategoryState(value: unknown, lang: Lang): PromptC
   };
 }
 
-function loadState(lang: Lang): PromptCategoryState {
+function loadState(lang: Lang, options: ManagedCategoryOptions): PromptCategoryState {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return initialState(lang);
-    return sanitizePromptCategoryState(JSON.parse(raw), lang);
+    const raw = localStorage.getItem(options.storageKey);
+    if (!raw) return initialState(lang, options);
+    return sanitizePromptCategoryState(JSON.parse(raw), lang, options);
   } catch {
-    return initialState(lang);
+    return initialState(lang, options);
   }
 }
 
-function saveState(state: PromptCategoryState) {
+function saveState(storageKey: string, state: PromptCategoryState) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    localStorage.setItem(storageKey, JSON.stringify(state));
     return true;
   } catch {
     return false;
@@ -122,12 +136,12 @@ function nextCategoryId(categories: PromptCategory[]) {
   return id;
 }
 
-export function usePromptCategories(lang: Lang) {
-  const [state, setState] = React.useState<PromptCategoryState>(() => loadState(lang));
+export function useManagedCategories(lang: Lang, options: ManagedCategoryOptions) {
+  const [state, setState] = React.useState<PromptCategoryState>(() => loadState(lang, options));
 
   React.useEffect(() => {
-    saveState(state);
-  }, [state]);
+    saveState(options.storageKey, state);
+  }, [options.storageKey, state]);
 
   const categoryIds = React.useMemo(
     () => new Set(state.categories.map((category) => category.id)),
@@ -237,4 +251,8 @@ export function usePromptCategories(lang: Lang) {
     movePrompt,
     forgetPrompt,
   };
+}
+
+export function usePromptCategories(lang: Lang) {
+  return useManagedCategories(lang, PROMPT_CATEGORY_OPTIONS);
 }
