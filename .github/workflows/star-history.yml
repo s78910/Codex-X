@@ -1,0 +1,76 @@
+name: Refresh Star History
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: star-history-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    name: Refresh chart data
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Send authenticated repository snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INGEST_TOKEN: ${{ secrets.STAR_HISTORY_INGEST_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          CAMO_PURGE_URLS: ${{ vars.STAR_HISTORY_CAMO_URLS }}
+          STAR_HISTORY_ENDPOINT: ${{ vars.STAR_HISTORY_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          test -n "${INGEST_TOKEN}"
+          test -n "${STAR_HISTORY_ENDPOINT}"
+          metadata_file="${RUNNER_TEMP}/star-history-metadata.json"
+          payload_file="${RUNNER_TEMP}/star-history-payload.json"
+
+          gh api \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${REPOSITORY}" > "${metadata_file}"
+
+          jq -n \
+            --arg repository "${REPOSITORY}" \
+            --slurpfile metadata "${metadata_file}" \
+            '{
+                repository: $repository,
+                createdAt: $metadata[0].created_at,
+                checkedAt: (now | todateiso8601),
+                currentStars: $metadata[0].stargazers_count
+              }' > "${payload_file}"
+
+          curl \
+            --fail-with-body \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            --max-time 240 \
+            --request POST \
+            --header "Authorization: Bearer ${INGEST_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data-binary "@${payload_file}" \
+            "${STAR_HISTORY_ENDPOINT}"
+
+          while IFS= read -r camo_url; do
+            test -n "${camo_url}" || continue
+            case "${camo_url}" in
+              https://camo.githubusercontent.com/*) ;;
+              *) echo "::warning::Skipped an invalid Camo purge URL"; continue ;;
+            esac
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --retry 2 \
+              --request PURGE \
+              "${camo_url}" > /dev/null \
+              || echo "::warning::GitHub Camo purge failed and will be retried on the next refresh"
+          done <<< "${CAMO_PURGE_URLS}"
