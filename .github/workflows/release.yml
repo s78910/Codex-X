@@ -460,6 +460,8 @@ jobs:
             --manifest latest.json \
             --assets release-assets.json \
             --version "$VERSION" \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
             --rewrite-download-urls \
             --require-signature-assets
           gh release upload "$RELEASE_TAG" latest.json --clobber
@@ -498,7 +500,9 @@ jobs:
           python3 scripts/validate_updater_release.py \
             --manifest published-latest.json \
             --assets release-assets.json \
-            --version "$VERSION"
+            --version "$VERSION" \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG"
 
           python3 - <<'PY' > updater-urls.txt
           import json
@@ -507,9 +511,11 @@ jobs:
               print(entry["url"])
           PY
           sort -u updater-urls.txt | while read -r url; do
-            curl -fsSLI \
+            curl -fsSL \
+              --range 0-0 \
               --retry 5 \
               --retry-delay 3 \
               --retry-all-errors \
-              "$url" >/dev/null
+              "$url" \
+              -o /dev/null
           done

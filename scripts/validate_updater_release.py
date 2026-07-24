@@ -9,6 +9,7 @@ import binascii
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote, urlparse
 
 
 REQUIRED_PLATFORMS = {
@@ -48,10 +49,20 @@ def validate_signature(platform: str, value: Any) -> None:
         fail(f"{platform} signature is unexpectedly short")
 
 
+def canonical_asset_url(repository: str, release_tag: str, asset_name: str) -> str:
+    return (
+        f"https://github.com/{repository}/releases/download/"
+        f"{quote(release_tag, safe='')}/{quote(asset_name, safe='')}"
+    )
+
+
 def rewrite_download_urls(
     manifest_path: Path,
     manifest: dict[str, Any],
     assets_by_url: dict[str, dict[str, Any]],
+    assets_by_name: dict[str, dict[str, Any]],
+    repository: str,
+    release_tag: str,
 ) -> int:
     platforms = manifest.get("platforms")
     if not isinstance(platforms, dict):
@@ -66,10 +77,13 @@ def rewrite_download_urls(
             fail(f"{platform} has an invalid download URL")
         asset = assets_by_url.get(current_url)
         if asset is None:
+            parsed_url = urlparse(current_url)
+            asset_name = unquote(parsed_url.path.rsplit("/", 1)[-1])
+            if parsed_url.scheme == "https" and parsed_url.netloc == "github.com":
+                asset = assets_by_name.get(asset_name)
+        if asset is None:
             fail(f"{platform} URL does not point to an asset in this release")
-        download_url = asset.get("browser_download_url")
-        if not isinstance(download_url, str) or not download_url.startswith("https://"):
-            fail(f"{platform} asset has no public download URL")
+        download_url = canonical_asset_url(repository, release_tag, asset["name"])
         if current_url != download_url:
             entry["url"] = download_url
             rewritten += 1
@@ -86,9 +100,15 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--release-tag", required=True)
     parser.add_argument("--rewrite-download-urls", action="store_true")
     parser.add_argument("--require-signature-assets", action="store_true")
     args = parser.parse_args()
+
+    repository_parts = args.repository.split("/")
+    if len(repository_parts) != 2 or not all(repository_parts):
+        fail(f"invalid GitHub repository {args.repository!r}")
 
     manifest = load_json(args.manifest)
     assets = load_json(args.assets)
@@ -102,15 +122,20 @@ def main() -> None:
         )
 
     asset_names: set[str] = set()
+    assets_by_name: dict[str, dict[str, Any]] = {}
     assets_by_url: dict[str, dict[str, Any]] = {}
     for asset in assets:
         if not isinstance(asset, dict) or not isinstance(asset.get("name"), str):
             fail("release assets response contains an invalid entry")
         asset_names.add(asset["name"])
+        assets_by_name[asset["name"]] = asset
         for field in ("url", "browser_download_url"):
             value = asset.get(field)
             if isinstance(value, str) and value:
                 assets_by_url[value] = asset
+        assets_by_url[
+            canonical_asset_url(args.repository, args.release_tag, asset["name"])
+        ] = asset
 
     if "latest.json" not in asset_names:
         fail("the draft release does not contain latest.json")
@@ -120,7 +145,14 @@ def main() -> None:
         fail("latest.json has no platforms object")
 
     if args.rewrite_download_urls:
-        rewritten = rewrite_download_urls(args.manifest, manifest, assets_by_url)
+        rewritten = rewrite_download_urls(
+            args.manifest,
+            manifest,
+            assets_by_url,
+            assets_by_name,
+            args.repository,
+            args.release_tag,
+        )
         print(f"Rewrote {rewritten} updater asset URLs to public download URLs.")
 
     for platform, entry in platforms.items():
@@ -133,8 +165,13 @@ def main() -> None:
         asset = assets_by_url.get(url)
         if asset is None:
             fail(f"{platform} URL does not point to an asset in this release")
-        if url != asset.get("browser_download_url"):
-            fail(f"{platform} URL points to GitHub metadata instead of the asset download")
+        expected_url = canonical_asset_url(
+            args.repository,
+            args.release_tag,
+            asset["name"],
+        )
+        if url != expected_url:
+            fail(f"{platform} URL does not use the stable release tag download URL")
 
     for platform, suffix in REQUIRED_PLATFORMS.items():
         entry = platforms.get(platform)
